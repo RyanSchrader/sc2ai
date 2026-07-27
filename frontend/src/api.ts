@@ -17,17 +17,43 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
       ...(options?.headers ?? {}),
     },
   });
+  const contentType = response.headers.get("content-type") ?? "";
+  const rawBody = await response.text();
+  const receivedHtml =
+    contentType.includes("text/html") ||
+    rawBody.trimStart().toLowerCase().startsWith("<!doctype");
+
+  let body: unknown;
+  if (rawBody) {
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      if (receivedHtml) {
+        throw new ApiError(
+          502,
+          "Bot Studio API is unavailable: the frontend received HTML instead of JSON. Restart the development server with make dev.",
+        );
+      }
+      throw new ApiError(
+        response.ok ? 502 : response.status,
+        "Bot Studio API returned an invalid response.",
+      );
+    }
+  }
+
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
-    try {
-      const body = await response.json();
-      message = body.detail ?? message;
-    } catch {
-      // Preserve the status fallback.
+    if (
+      typeof body === "object" &&
+      body !== null &&
+      "detail" in body &&
+      typeof body.detail === "string"
+    ) {
+      message = body.detail;
     }
     throw new ApiError(response.status, message);
   }
-  return response.json() as Promise<T>;
+  return body as T;
 }
 
 export const jsonOptions = (method: string, body?: unknown): RequestInit => ({
