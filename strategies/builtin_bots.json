@@ -1,0 +1,587 @@
+[
+  {
+    "slug": "protoss-basic",
+    "name": "Protoss Basic",
+    "description": "Simple Protoss macro strategy with Zealot pressure.",
+    "race": "protoss",
+    "tags": ["built-in", "macro", "beginner"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "protoss",
+      "opening_chat": "GL HF - ProtossBasicBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build probes to 50", "priority": 10, "actions": [{"type": "train_workers", "amount": 50}]},
+            {"id": "supply", "name": "Keep five supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 5}]},
+            {"id": "gas-one", "name": "Take first gas", "priority": 30, "actions": [{"type": "maintain_gas", "structure": "ASSIMILATOR", "amount": 1}]},
+            {
+              "id": "gas-two",
+              "name": "Take second gas at 24 workers",
+              "priority": 31,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 24},
+              "actions": [{"type": "maintain_gas", "structure": "ASSIMILATOR", "amount": 2}]
+            },
+            {
+              "id": "expand",
+              "name": "Expand at 22 workers",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 22},
+              "actions": [{"type": "expand", "structure": "NEXUS", "amount": 2}]
+            }
+          ]
+        },
+        {
+          "id": "production",
+          "name": "Production",
+          "order": 1,
+          "rules": [
+            {
+              "id": "gateways",
+              "name": "Build two Gateways",
+              "priority": 50,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "PYLON", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 2, "distance": 8}]
+            },
+            {
+              "id": "zealots",
+              "name": "Continuously train Zealots",
+              "priority": 60,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "GATEWAY", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "train_units", "unit": "ZEALOT"}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack with 12 Zealots", "priority": 100, "actions": [{"type": "attack", "units": ["ZEALOT"], "min_size": 12}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "protoss-intermediate",
+    "name": "Protoss Intermediate",
+    "description": "Three-base Protoss macro with a Stalker and Zealot army.",
+    "race": "protoss",
+    "tags": ["built-in", "macro", "intermediate"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "protoss",
+      "opening_chat": "GL HF - ProtossIntermediateBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build probes to 65", "priority": 10, "actions": [{"type": "train_workers", "amount": 65}]},
+            {"id": "supply", "name": "Keep seven supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 7}]},
+            {"id": "gas-two", "name": "Maintain two Assimilators", "priority": 30, "actions": [{"type": "maintain_gas", "structure": "ASSIMILATOR", "amount": 2}]},
+            {
+              "id": "gas-four",
+              "name": "Take four gases on two bases",
+              "priority": 31,
+              "trigger": {"kind": "metric", "metric": "bases", "comparator": "gte", "value": 2},
+              "actions": [{"type": "maintain_gas", "structure": "ASSIMILATOR", "amount": 4}]
+            },
+            {
+              "id": "second-base",
+              "name": "Expand at 22 workers",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 22},
+              "actions": [{"type": "expand", "structure": "NEXUS", "amount": 2}]
+            },
+            {
+              "id": "third-base",
+              "name": "Take third base at 48 workers",
+              "priority": 41,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 48},
+              "actions": [{"type": "expand", "structure": "NEXUS", "amount": 3}]
+            }
+          ]
+        },
+        {
+          "id": "production",
+          "name": "Production",
+          "order": 1,
+          "rules": [
+            {
+              "id": "two-gates",
+              "name": "Build two Gateways",
+              "priority": 50,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "PYLON", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 2, "distance": 9}]
+            },
+            {
+              "id": "four-gates",
+              "name": "Build four Gateways on two bases",
+              "priority": 51,
+              "trigger": {"kind": "metric", "metric": "bases", "comparator": "gte", "value": 2},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 4, "distance": 9}]
+            },
+            {
+              "id": "five-gates",
+              "name": "Build fifth Gateway at 46 workers",
+              "priority": 52,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 46},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 5, "distance": 9}]
+            },
+            {
+              "id": "core",
+              "name": "Build Cybernetics Core",
+              "priority": 55,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "GATEWAY", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "CYBERNETICSCORE", "amount": 1, "distance": 9}]
+            },
+            {
+              "id": "army",
+              "name": "Train Stalkers with Zealot fallback",
+              "priority": 60,
+              "actions": [{"type": "train_units", "unit": "STALKER", "fallback_units": ["ZEALOT"]}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack with a 20-unit army", "priority": 100, "actions": [{"type": "attack", "units": ["ZEALOT", "STALKER"], "min_size": 20}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "zerg-basic-1",
+    "name": "Zerg Basic Swarm",
+    "description": "Three-base Zergling pressure transitioning into Roach reinforcements.",
+    "race": "zerg",
+    "tags": ["built-in", "swarm", "beginner", "roach-transition"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "zerg",
+      "opening_chat": "GL HF - Zerg Basic Swarm: ling pressure into Roaches.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build Drones to 48", "priority": 10, "actions": [{"type": "train_workers", "amount": 48}]},
+            {"id": "supply", "name": "Keep five supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 5}]},
+            {
+              "id": "gas",
+              "name": "Take one Extractor after 24 workers",
+              "priority": 30,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 24},
+              "actions": [{"type": "maintain_gas", "structure": "EXTRACTOR", "amount": 1}]
+            },
+            {
+              "id": "second-base",
+              "name": "Expand at 18 workers",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 18},
+              "actions": [{"type": "expand", "structure": "HATCHERY", "amount": 2}]
+            },
+            {
+              "id": "third-base",
+              "name": "Take third base at 32 workers",
+              "priority": 41,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 32},
+              "actions": [{"type": "expand", "structure": "HATCHERY", "amount": 3}]
+            }
+          ]
+        },
+        {
+          "id": "production",
+          "name": "Production",
+          "order": 1,
+          "rules": [
+            {"id": "pool", "name": "Build Spawning Pool", "priority": 50, "actions": [{"type": "build_structure", "structure": "SPAWNINGPOOL", "amount": 1, "distance": 5}]},
+            {
+              "id": "warren",
+              "name": "Build Roach Warren after first 24 Zerglings",
+              "priority": 51,
+              "trigger": {"kind": "metric", "metric": "unit_count", "subject": "ZERGLING", "comparator": "gte", "value": 24},
+              "actions": [{"type": "build_structure", "structure": "ROACHWARREN", "amount": 1, "distance": 6}]
+            },
+            {
+              "id": "zerglings",
+              "name": "Train Zerglings until Roach tech is ready",
+              "priority": 60,
+              "trigger": {
+                "kind": "all",
+                "children": [
+                  {"kind": "metric", "metric": "structure_count", "subject": "SPAWNINGPOOL", "status": "ready", "comparator": "gte", "value": 1},
+                  {"kind": "metric", "metric": "structure_count", "subject": "ROACHWARREN", "status": "ready", "comparator": "lt", "value": 1}
+                ]
+              },
+              "actions": [{"type": "train_units", "unit": "ZERGLING"}]
+            },
+            {
+              "id": "roaches",
+              "name": "Reinforce with Roaches and Zergling fallback",
+              "priority": 61,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "ROACHWARREN", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "train_units", "unit": "ROACH", "fallback_units": ["ZERGLING"]}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {
+              "id": "attack",
+              "name": "Attack with 24 Zerglings, then mixed reinforcements",
+              "priority": 100,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "ROACHWARREN", "status": "total", "comparator": "gte", "value": 1},
+              "actions": [{"type": "attack", "units": ["ROACH", "ZERGLING"], "min_size": 24}]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "zerg-basic-2",
+    "name": "Zerg Basic Roach",
+    "description": "Roach-focused Zerg macro strategy with Zergling fallback.",
+    "race": "zerg",
+    "tags": ["built-in", "macro", "roach"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "zerg",
+      "opening_chat": "GL HF - ZergBasicRoachBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build Drones to 60", "priority": 10, "actions": [{"type": "train_workers", "amount": 60}]},
+            {"id": "supply", "name": "Keep three supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 3}]},
+            {"id": "gas-two", "name": "Maintain two Extractors", "priority": 30, "actions": [{"type": "maintain_gas", "structure": "EXTRACTOR", "amount": 2}]},
+            {
+              "id": "gas-four",
+              "name": "Take four Extractors on two bases",
+              "priority": 31,
+              "trigger": {"kind": "metric", "metric": "bases", "comparator": "gte", "value": 2},
+              "actions": [{"type": "maintain_gas", "structure": "EXTRACTOR", "amount": 4}]
+            },
+            {
+              "id": "second-base",
+              "name": "Expand at 20 workers",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 20},
+              "actions": [{"type": "expand", "structure": "HATCHERY", "amount": 2}]
+            },
+            {
+              "id": "third-base",
+              "name": "Take third base at 45 workers",
+              "priority": 41,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 45},
+              "actions": [{"type": "expand", "structure": "HATCHERY", "amount": 3}]
+            }
+          ]
+        },
+        {
+          "id": "production",
+          "name": "Production",
+          "order": 1,
+          "rules": [
+            {"id": "pool", "name": "Build Spawning Pool", "priority": 50, "actions": [{"type": "build_structure", "structure": "SPAWNINGPOOL", "amount": 1, "distance": 5}]},
+            {
+              "id": "warren",
+              "name": "Build Roach Warren",
+              "priority": 51,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "SPAWNINGPOOL", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "ROACHWARREN", "amount": 1, "distance": 6}]
+            },
+            {
+              "id": "roaches",
+              "name": "Train Roaches with Zergling fallback",
+              "priority": 60,
+              "actions": [{"type": "train_units", "unit": "ROACH", "fallback_units": ["ZERGLING"]}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack at 10 Roaches and 20 total army", "priority": 100, "actions": [{"type": "attack", "units": ["ROACH", "ZERGLING"], "min_size": 20, "required_unit": "ROACH", "required_amount": 10}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "terran-basic",
+    "name": "Terran Basic",
+    "description": "Three-base Terran Marine macro strategy.",
+    "race": "terran",
+    "tags": ["built-in", "macro", "beginner"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "terran",
+      "opening_chat": "GL HF - TerranBasicBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build SCVs to 70", "priority": 10, "actions": [{"type": "train_workers", "amount": 70}]},
+            {"id": "supply", "name": "Keep six supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 6}]},
+            {"id": "gas-two", "name": "Maintain two Refineries", "priority": 30, "actions": [{"type": "maintain_gas", "structure": "REFINERY", "amount": 2}]},
+            {
+              "id": "gas-four",
+              "name": "Take four Refineries on two bases",
+              "priority": 31,
+              "trigger": {"kind": "metric", "metric": "bases", "comparator": "gte", "value": 2},
+              "actions": [{"type": "maintain_gas", "structure": "REFINERY", "amount": 4}]
+            },
+            {
+              "id": "second-base",
+              "name": "Expand at 20 workers",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 20},
+              "actions": [{"type": "expand", "structure": "COMMANDCENTER", "amount": 2}]
+            },
+            {
+              "id": "third-base",
+              "name": "Take third base at 45 workers",
+              "priority": 41,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 45},
+              "actions": [{"type": "expand", "structure": "COMMANDCENTER", "amount": 3}]
+            }
+          ]
+        },
+        {
+          "id": "production",
+          "name": "Production",
+          "order": 1,
+          "rules": [
+            {
+              "id": "two-barracks",
+              "name": "Build two Barracks",
+              "priority": 50,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "SUPPLYDEPOT", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "BARRACKS", "amount": 2, "distance": 11}]
+            },
+            {
+              "id": "four-barracks",
+              "name": "Build four Barracks on two bases",
+              "priority": 51,
+              "trigger": {"kind": "metric", "metric": "bases", "comparator": "gte", "value": 2},
+              "actions": [{"type": "build_structure", "structure": "BARRACKS", "amount": 4, "distance": 11}]
+            },
+            {"id": "marines", "name": "Continuously train Marines", "priority": 60, "actions": [{"type": "train_units", "unit": "MARINE"}]}
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack with 16 Marines", "priority": 100, "actions": [{"type": "attack", "units": ["MARINE"], "min_size": 16}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "protoss-tower-rush",
+    "name": "Protoss Tower Rush",
+    "description": "Forward Pylon and Photon Cannon rush with Zealot support.",
+    "race": "protoss",
+    "tags": ["built-in", "rush", "cheese"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "protoss",
+      "opening_chat": "GL HF - ProtossTowerRushBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build probes to 32", "priority": 10, "actions": [{"type": "train_workers", "amount": 32}]},
+            {"id": "supply", "name": "Keep four supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 4}]}
+          ]
+        },
+        {
+          "id": "rush",
+          "name": "Tower Rush",
+          "order": 1,
+          "rules": [
+            {
+              "id": "gateway",
+              "name": "Build one Gateway",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "PYLON", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 1, "distance": 8}]
+            },
+            {"id": "zealots", "name": "Train Zealots", "priority": 50, "actions": [{"type": "train_units", "unit": "ZEALOT"}]},
+            {
+              "id": "forward-pylon",
+              "name": "Build forward Pylon",
+              "priority": 60,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "GATEWAY", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_forward", "structure": "PYLON", "amount": 1, "distance": 8}]
+            },
+            {
+              "id": "three-cannons",
+              "name": "Build three forward Cannons",
+              "priority": 70,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "PYLON", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_forward", "structure": "PHOTONCANNON", "amount": 3, "distance": 8}]
+            },
+            {
+              "id": "six-cannons",
+              "name": "Scale to six Cannons at 24 workers",
+              "priority": 71,
+              "trigger": {"kind": "metric", "metric": "workers", "comparator": "gte", "value": 24},
+              "actions": [{"type": "build_forward", "structure": "PHOTONCANNON", "amount": 6, "distance": 8}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack with six Zealots", "priority": 100, "actions": [{"type": "attack", "units": ["ZEALOT"], "min_size": 6}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "terran-bunker-rush",
+    "name": "Terran Bunker Rush",
+    "description": "Forward Supply Depot and Bunker pressure backed by Marines.",
+    "race": "terran",
+    "tags": ["built-in", "rush", "cheese"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "terran",
+      "opening_chat": "GL HF - TerranBunkerRushBot online.",
+      "phases": [
+        {
+          "id": "economy",
+          "name": "Economy",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Build SCVs to 30", "priority": 10, "actions": [{"type": "train_workers", "amount": 30}]},
+            {"id": "supply", "name": "Keep four supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 4}]}
+          ]
+        },
+        {
+          "id": "rush",
+          "name": "Bunker Rush",
+          "order": 1,
+          "rules": [
+            {
+              "id": "barracks",
+              "name": "Build two Barracks",
+              "priority": 40,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "SUPPLYDEPOT", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "BARRACKS", "amount": 2, "distance": 9}]
+            },
+            {"id": "marines", "name": "Train Marines", "priority": 50, "actions": [{"type": "train_units", "unit": "MARINE"}]},
+            {
+              "id": "forward-depot",
+              "name": "Build forward Supply Depot",
+              "priority": 60,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "BARRACKS", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_forward", "structure": "SUPPLYDEPOT", "amount": 1, "distance": 10}]
+            },
+            {
+              "id": "two-bunkers",
+              "name": "Build two forward Bunkers",
+              "priority": 70,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "BARRACKS", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_forward", "structure": "BUNKER", "amount": 2, "distance": 10}]
+            },
+            {
+              "id": "third-bunker",
+              "name": "Add third Bunker at 12 Marines",
+              "priority": 71,
+              "trigger": {"kind": "metric", "metric": "unit_count", "subject": "MARINE", "comparator": "gte", "value": 12},
+              "actions": [{"type": "build_forward", "structure": "BUNKER", "amount": 3, "distance": 10}]
+            }
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "Combat",
+          "order": 2,
+          "rules": [
+            {"id": "attack", "name": "Attack with ten Marines", "priority": 100, "actions": [{"type": "attack", "units": ["MARINE"], "min_size": 10}]}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "slug": "ryan-zealot-rush",
+    "name": "Ryan Zealot Rush",
+    "description": "Legacy one-base four-Gateway Zealot all-in, migrated to the safe strategy engine.",
+    "race": "protoss",
+    "tags": ["built-in", "legacy", "rush"],
+    "strategy": {
+      "schema_version": 1,
+      "race": "protoss",
+      "opening_chat": "(glhf)",
+      "phases": [
+        {
+          "id": "opening",
+          "name": "One-base Opening",
+          "order": 0,
+          "rules": [
+            {"id": "distribute", "name": "Distribute workers", "priority": 1, "actions": [{"type": "distribute_workers"}]},
+            {"id": "workers", "name": "Saturate one base", "priority": 10, "actions": [{"type": "train_workers", "amount": 16}]},
+            {"id": "supply", "name": "Keep four supply free", "priority": 20, "actions": [{"type": "maintain_supply", "buffer": 4}]},
+            {
+              "id": "four-gates",
+              "name": "Build four Gateways",
+              "priority": 30,
+              "trigger": {"kind": "metric", "metric": "structure_count", "subject": "PYLON", "status": "ready", "comparator": "gte", "value": 1},
+              "actions": [{"type": "build_structure", "structure": "GATEWAY", "amount": 4, "distance": 8}]
+            },
+            {"id": "zealots", "name": "Continuously train Zealots", "priority": 40, "actions": [{"type": "train_units", "unit": "ZEALOT"}]}
+          ]
+        },
+        {
+          "id": "combat",
+          "name": "All-in",
+          "order": 1,
+          "rules": [
+            {"id": "attack", "name": "Attack with eight Zealots", "priority": 100, "actions": [{"type": "attack", "units": ["ZEALOT"], "min_size": 8}]},
+            {"id": "last-stand", "name": "Pull workers if the Nexus dies", "priority": 110, "actions": [{"type": "emergency_worker_attack"}]}
+          ]
+        }
+      ]
+    }
+  }
+]
