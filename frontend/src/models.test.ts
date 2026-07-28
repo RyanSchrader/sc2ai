@@ -7,6 +7,9 @@ describe("strategy helpers", () => {
     expect(strategy.race).toBe("terran");
     expect(strategy.phases).toHaveLength(1);
     expect(strategy.phases[0].rules[0].actions[0].type).toBe("distribute_workers");
+    expect(strategy.settings).not.toHaveProperty("attack_target");
+    expect(strategy.phases[0].activation).toEqual({ kind: "always" });
+    expect(strategy.phases[0].rules[0]).not.toHaveProperty("cooldown_seconds");
   });
 
   it("renders readable trigger and action summaries", () => {

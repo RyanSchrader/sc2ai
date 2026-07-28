@@ -71,6 +71,26 @@ def parse_args() -> argparse.Namespace:
         help="Exact revision for --opponent-bot.",
     )
     parser.add_argument(
+        "--bot-revision-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--bot-revision-digest",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--opponent-revision-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--opponent-revision-digest",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--random-seed",
         type=int,
         default=None,
@@ -182,6 +202,20 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         print("Run with --list-bots to see available bots.", file=sys.stderr)
         return 2
+    if args.bot_revision_id and record["selectedRevisionId"] != args.bot_revision_id:
+        print(
+            "Primary bot revision failed its expected identity check.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.bot_revision_digest and (
+        record["selectedRevisionDigest"] != args.bot_revision_digest
+    ):
+        print(
+            "Primary bot revision failed its expected content-digest check.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         selected_map = maps.get(args.map_name)
@@ -207,6 +241,23 @@ def main() -> int:
             )
         except NotFoundError as exc:
             print(str(exc), file=sys.stderr)
+            return 2
+        if args.opponent_revision_id and (
+            opponent_record["selectedRevisionId"] != args.opponent_revision_id
+        ):
+            print(
+                "Opponent bot revision failed its expected identity check.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.opponent_revision_digest and (
+            opponent_record["selectedRevisionDigest"]
+            != args.opponent_revision_digest
+        ):
+            print(
+                "Opponent bot revision failed its expected content-digest check.",
+                file=sys.stderr,
+            )
             return 2
         if opponent_record["id"] == record["id"] and (
             opponent_record["selectedRevision"] == primary_revision

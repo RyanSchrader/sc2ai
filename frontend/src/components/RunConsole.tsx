@@ -18,14 +18,45 @@ interface RunRecord {
   gameTimeSeconds: number | null;
   failureReason: string | null;
   returnCode: number | null;
+  logCount?: number;
+  firstLogSequence?: number;
+}
+
+interface RunLogEvent {
+  type: "log";
+  sequence?: number;
+  line: string;
+}
+
+interface RunLogGapEvent {
+  type: "log_gap";
+  after?: number;
+  firstAvailable?: number;
+  lastDropped?: number;
+}
+
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "stopped"]);
+const RUN_POLL_INTERVAL_MS = 1_000;
+const MAX_RUN_POLL_ATTEMPTS = 1_800;
+export const MAX_RETAINED_CLIENT_LOGS = 5_000;
+export const RUN_STREAM_RECONNECT_INTERVAL_MS = 500;
+export const MAX_RUN_STREAM_RECONNECT_ATTEMPTS = 20;
+
+export function retainClientLogs(current: string[], entries: string[]): string[] {
+  const next = [...current, ...entries];
+  return next.length > MAX_RETAINED_CLIENT_LOGS
+    ? next.slice(-MAX_RETAINED_CLIENT_LOGS)
+    : next;
 }
 
 export default function RunConsole({
   bot,
   onBack,
+  onMatchFinished,
 }: {
   bot: BotSummary;
   onBack: () => void;
+  onMatchFinished: () => void | Promise<void>;
 }) {
   const [maps, setMaps] = useState<string[]>([]);
   const [mapName, setMapName] = useState("");
@@ -40,6 +71,16 @@ export default function RunConsole({
   const [busy, setBusy] = useState(false);
   const consoleRef = useRef<HTMLPreElement>(null);
   const eventSource = useRef<EventSource | null>(null);
+  const pollTimer = useRef<number | null>(null);
+  const pollGeneration = useRef(0);
+  const pollingRunId = useRef<string | null>(null);
+  const reconnectTimer = useRef<number | null>(null);
+  const streamGeneration = useRef(0);
+  const streamReconnectAttempts = useRef(0);
+  const streamRecoveryExhausted = useRef(false);
+  const lastLogSequence = useRef(0);
+  const terminalRun = useRef<RunRecord | null>(null);
+  const reportedRunIds = useRef(new Set<string>());
 
   useEffect(() => {
     void Promise.all([
@@ -60,7 +101,20 @@ export default function RunConsole({
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : "Could not load match options."),
       );
-    return () => eventSource.current?.close();
+    return () => {
+      streamGeneration.current += 1;
+      pollGeneration.current += 1;
+      eventSource.current?.close();
+      eventSource.current = null;
+      if (pollTimer.current !== null) {
+        window.clearTimeout(pollTimer.current);
+        pollTimer.current = null;
+      }
+      if (reconnectTimer.current !== null) {
+        window.clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -69,7 +123,241 @@ export default function RunConsole({
     }
   }, [logs]);
 
+  const reportMatchFinished = (record: RunRecord) => {
+    if (
+      !TERMINAL_RUN_STATUSES.has(record.status) ||
+      reportedRunIds.current.has(record.id)
+    ) {
+      return;
+    }
+    reportedRunIds.current.add(record.id);
+    void onMatchFinished();
+  };
+
+  const clearPollTimer = () => {
+    if (pollTimer.current !== null) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer.current !== null) {
+      window.clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+  };
+
+  const closeEventStream = () => {
+    eventSource.current?.close();
+    eventSource.current = null;
+  };
+
+  const stopPolling = () => {
+    pollGeneration.current += 1;
+    pollingRunId.current = null;
+    clearPollTimer();
+  };
+
+  const stopWatchingRun = () => {
+    streamGeneration.current += 1;
+    stopPolling();
+    clearReconnectTimer();
+    closeEventStream();
+    terminalRun.current = null;
+  };
+
+  const updateRun = (record: RunRecord) => {
+    setRun(record);
+    reportMatchFinished(record);
+    return TERMINAL_RUN_STATUSES.has(record.status);
+  };
+
+  const appendLogEntries = (entries: string[]) => {
+    if (!entries.length) return;
+    setLogs((current) => retainClientLogs(current, entries));
+  };
+
+  const unrecoveredLogCount = (record: RunRecord) =>
+    typeof record.logCount === "number"
+      ? Math.max(0, record.logCount - lastLogSequence.current)
+      : 0;
+
+  const settleTerminalRun = (record: RunRecord) => {
+    updateRun(record);
+    terminalRun.current = record;
+    const missing = unrecoveredLogCount(record);
+    if (missing > 0 && !streamRecoveryExhausted.current) return false;
+    if (missing > 0) {
+      appendLogEntries([
+        `[Could not recover ${missing} final match output line${missing === 1 ? "" : "s"} after repeated stream disconnects.]`,
+      ]);
+    }
+    stopWatchingRun();
+    return true;
+  };
+
+  const exhaustStreamRecovery = () => {
+    if (streamRecoveryExhausted.current) return;
+    streamRecoveryExhausted.current = true;
+    clearReconnectTimer();
+    if (terminalRun.current) {
+      settleTerminalRun(terminalRun.current);
+    } else {
+      appendLogEntries([
+        "[Live match output could not reconnect; status monitoring will continue.]",
+      ]);
+    }
+  };
+
+  const pollRunUntilTerminal = (runId: string) => {
+    if (pollingRunId.current === runId) return;
+    clearPollTimer();
+    pollingRunId.current = runId;
+    const generation = ++pollGeneration.current;
+
+    const poll = async (attempt: number) => {
+      if (pollGeneration.current !== generation) return;
+      pollTimer.current = null;
+
+      try {
+        const refreshed = await api<RunRecord>(`/runs/${runId}`);
+        if (pollGeneration.current !== generation) return;
+        if (TERMINAL_RUN_STATUSES.has(refreshed.status)) {
+          pollingRunId.current = null;
+          settleTerminalRun(refreshed);
+          return;
+        }
+        updateRun(refreshed);
+      } catch {
+        // A transient polling failure should not abandon recovery.
+      }
+
+      if (pollGeneration.current !== generation) return;
+      if (attempt + 1 >= MAX_RUN_POLL_ATTEMPTS) {
+        pollingRunId.current = null;
+        setError("Could not confirm the final match status. Check that the backend is running.");
+        return;
+      }
+      pollTimer.current = window.setTimeout(
+        () => void poll(attempt + 1),
+        RUN_POLL_INTERVAL_MS,
+      );
+    };
+
+    void poll(0);
+  };
+
+  const recordLogEvent = (payload: RunLogEvent) => {
+    if (typeof payload.sequence !== "number") {
+      appendLogEntries([payload.line]);
+      return;
+    }
+    if (payload.sequence <= lastLogSequence.current) return;
+
+    const additions: string[] = [];
+    if (payload.sequence > lastLogSequence.current + 1) {
+      additions.push(
+        `[Match output lines ${lastLogSequence.current + 1}–${payload.sequence - 1} were unavailable.]`,
+      );
+    }
+    lastLogSequence.current = payload.sequence;
+    additions.push(payload.line);
+    appendLogEntries(additions);
+  };
+
+  const recordLogGap = (payload: RunLogGapEvent) => {
+    const lastDropped =
+      typeof payload.lastDropped === "number"
+        ? payload.lastDropped
+        : typeof payload.firstAvailable === "number"
+          ? payload.firstAvailable - 1
+          : null;
+    if (lastDropped == null || lastDropped <= lastLogSequence.current) return;
+
+    lastLogSequence.current = lastDropped;
+    const resumeAt =
+      typeof payload.firstAvailable === "number"
+        ? ` Resuming at line ${payload.firstAvailable}.`
+        : "";
+    appendLogEntries([`[Earlier match output was trimmed.${resumeAt}]`]);
+  };
+
+  function scheduleEventStreamReconnect(
+    record: RunRecord,
+    generation: number,
+  ) {
+    if (
+      streamGeneration.current !== generation ||
+      reconnectTimer.current !== null
+    ) {
+      return;
+    }
+    if (streamReconnectAttempts.current >= MAX_RUN_STREAM_RECONNECT_ATTEMPTS) {
+      exhaustStreamRecovery();
+      return;
+    }
+
+    reconnectTimer.current = window.setTimeout(() => {
+      reconnectTimer.current = null;
+      if (streamGeneration.current !== generation) return;
+      streamReconnectAttempts.current += 1;
+      openEventStream(record, generation);
+    }, RUN_STREAM_RECONNECT_INTERVAL_MS);
+  }
+
+  function openEventStream(record: RunRecord, generation: number) {
+    if (streamGeneration.current !== generation) return;
+    closeEventStream();
+    const source = new EventSource(
+      `/api/runs/${record.id}/events?after=${lastLogSequence.current}`,
+    );
+    eventSource.current = source;
+
+    source.onmessage = (event) => {
+      if (
+        streamGeneration.current !== generation ||
+        eventSource.current !== source
+      ) {
+        return;
+      }
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(event.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (payload.type === "log") {
+        recordLogEvent(payload as unknown as RunLogEvent);
+      } else if (payload.type === "log_gap") {
+        recordLogGap(payload as unknown as RunLogGapEvent);
+      } else if (payload.type === "status") {
+        const refreshed = { ...record, ...payload } as RunRecord;
+        if (TERMINAL_RUN_STATUSES.has(refreshed.status)) {
+          settleTerminalRun(refreshed);
+        } else {
+          updateRun(refreshed);
+        }
+      }
+    };
+    source.onerror = () => {
+      if (
+        streamGeneration.current !== generation ||
+        eventSource.current !== source
+      ) {
+        source.close();
+        return;
+      }
+      closeEventStream();
+      if (!terminalRun.current) {
+        pollRunUntilTerminal(record.id);
+      }
+      scheduleEventStreamReconnect(record, generation);
+    };
+  }
+
   const start = async () => {
+    stopWatchingRun();
     setBusy(true);
     setError(null);
     setLogs([]);
@@ -86,21 +374,12 @@ export default function RunConsole({
         }),
       );
       setRun(created);
-      const source = new EventSource(`/api/runs/${created.id}/events`);
-      eventSource.current = source;
-      source.onmessage = (event) => {
-        const payload = JSON.parse(event.data);
-        if (payload.type === "log") {
-          setLogs((current) => [...current, payload.line]);
-        } else if (payload.type === "status") {
-          setRun((current) => (current ? { ...current, ...payload } : current));
-          source.close();
-        }
-      };
-      source.onerror = () => {
-        source.close();
-        void refreshRun(created.id);
-      };
+      lastLogSequence.current = 0;
+      streamReconnectAttempts.current = 0;
+      streamRecoveryExhausted.current = false;
+      terminalRun.current = null;
+      const generation = ++streamGeneration.current;
+      openEventStream(created, generation);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not start match.");
     } finally {
@@ -108,20 +387,17 @@ export default function RunConsole({
     }
   };
 
-  const refreshRun = async (runId: string) => {
-    try {
-      setRun(await api<RunRecord>(`/runs/${runId}`));
-    } catch {
-      // The actionable error, if any, is already shown in the process log.
-    }
-  };
-
   const stop = async () => {
     if (!run) return;
     setBusy(true);
     try {
-      setRun(await api<RunRecord>(`/runs/${run.id}/stop`, jsonOptions("POST")));
-      window.setTimeout(() => void refreshRun(run.id), 500);
+      const stopping = await api<RunRecord>(`/runs/${run.id}/stop`, jsonOptions("POST"));
+      if (TERMINAL_RUN_STATUSES.has(stopping.status)) {
+        settleTerminalRun(stopping);
+      } else {
+        updateRun(stopping);
+        pollRunUntilTerminal(run.id);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not stop match.");
     } finally {

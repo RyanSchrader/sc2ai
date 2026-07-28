@@ -1,15 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from enum import Enum
 import re
+from typing import Callable
 
 from sc2.bot_ai import BotAI
+from sc2.ids.upgrade_id import UpgradeId
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.units import Units
 from s2clientprotocol import debug_pb2 as debug_pb
 from s2clientprotocol import sc2api_pb2 as sc_pb
 
-from .catalog import GAS_BY_RACE, PRODUCER_BY_UNIT, SUPPLY_BY_RACE, WORKER_BY_RACE
+from .catalog import (
+    ACTION_SPECS,
+    PRODUCER_BY_UNIT,
+    PRODUCER_BY_UPGRADE,
+    SUPPLY_BY_RACE,
+    WORKER_BY_RACE,
+    TargetLocation,
+)
 from .models import (
     ActionType,
     Comparator,
@@ -22,9 +33,15 @@ from .models import (
     StrategyRule,
 )
 
+DEFAULT_SUPPLY_BUILD_DISTANCE = 7
+
 
 def _unit_type(name: str) -> UnitTypeId:
     return getattr(UnitTypeId, name)
+
+
+def _upgrade_type(name: str) -> UpgradeId:
+    return getattr(UpgradeId, name)
 
 
 def compare(left: float, comparator: Comparator, right: float) -> bool:
@@ -35,6 +52,99 @@ def compare(left: float, comparator: Comparator, right: float) -> bool:
         Comparator.GTE: left >= right,
         Comparator.GT: left > right,
     }[comparator]
+
+
+class ActionStatus(str, Enum):
+    SATISFIED = "satisfied"
+    PROGRESSED = "progressed"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class ActionOutcome:
+    status: ActionStatus
+    reason: str
+
+    @property
+    def completes_once(self) -> bool:
+        """Only a fulfilled goal completes an ONCE rule.
+
+        A command that merely starts a count-based action is progress, so the
+        rule remains eligible until its target is observable in game state.
+        """
+        return self.status == ActionStatus.SATISFIED
+
+    @classmethod
+    def satisfied(cls, reason: str) -> "ActionOutcome":
+        return cls(ActionStatus.SATISFIED, reason)
+
+    @classmethod
+    def progressed(cls, reason: str) -> "ActionOutcome":
+        return cls(ActionStatus.PROGRESSED, reason)
+
+    @classmethod
+    def blocked(cls, reason: str) -> "ActionOutcome":
+        return cls(ActionStatus.BLOCKED, reason)
+
+
+@dataclass(frozen=True)
+class RuleEligibility:
+    allowed: bool
+    reason: str
+
+
+def rule_eligibility(
+    rule: StrategyRule,
+    *,
+    now: float,
+    completed_rules: set[str] | frozenset[str],
+    last_execution: dict[str, float],
+) -> RuleEligibility:
+    """Pure execution-policy decision used by the game adapter and tests."""
+    if rule.execution == ExecutionPolicy.ONCE and rule.id in completed_rules:
+        return RuleEligibility(False, "once rule already completed")
+    if rule.execution == ExecutionPolicy.COOLDOWN:
+        previous = last_execution.get(rule.id)
+        assert rule.cooldown_seconds is not None
+        if previous is not None and now - previous < rule.cooldown_seconds:
+            return RuleEligibility(False, "cooldown has not elapsed")
+    return RuleEligibility(True, "eligible")
+
+
+def condition_matches(
+    condition: Condition,
+    metric_reader: Callable[[Condition], float],
+) -> bool:
+    """Evaluate a validated condition without depending on a live SC2 client."""
+    if condition.kind == ConditionKind.ALWAYS:
+        return True
+    if condition.kind == ConditionKind.ALL:
+        return all(condition_matches(child, metric_reader) for child in condition.children)
+    if condition.kind == ConditionKind.ANY:
+        return any(condition_matches(child, metric_reader) for child in condition.children)
+    if condition.kind == ConditionKind.NOT:
+        return not condition_matches(condition.children[0], metric_reader)
+    return compare(metric_reader(condition), condition.comparator, condition.value)
+
+
+def target_count_outcome(current: float, target: int, noun: str) -> ActionOutcome | None:
+    """Return a completed outcome when a count target is already met."""
+    if current >= target:
+        return ActionOutcome.satisfied(
+            f"{noun} target met ({current:g}/{target})"
+        )
+    return None
+
+
+def once_rule_completed(
+    rule: StrategyRule,
+    outcomes: Iterable[ActionOutcome],
+) -> bool:
+    """Return whether this attempt fulfills an ONCE rule's whole action set."""
+    return (
+        rule.execution == ExecutionPolicy.ONCE
+        and all(outcome.completes_once for outcome in outcomes)
+    )
 
 
 def is_surrender_message(message: str) -> bool:
@@ -108,6 +218,8 @@ class DeclarativeBot(BotAI):
         self._completed_rules: set[str] = set()
         self._last_rule_execution: dict[str, float] = {}
         self._scheduled_structures: dict[UnitTypeId, int] = {}
+        self._scheduled_units: dict[UnitTypeId, int] = {}
+        self._scheduled_upgrades: set[UpgradeId] = set()
         self._scouted_expansions: dict[tuple[float, float], float] = {}
         self._last_activity_signature: tuple[float, ...] | None = None
         self._last_activity_time = 0.0
@@ -121,6 +233,8 @@ class DeclarativeBot(BotAI):
         if await self._end_if_stalemate():
             return
         self._scheduled_structures = {}
+        self._scheduled_units = {}
+        self._scheduled_upgrades = set()
         if iteration == 0 and self.strategy.opening_chat:
             await self.chat_send(self.strategy.opening_chat)
 
@@ -136,11 +250,11 @@ class DeclarativeBot(BotAI):
         for rule in sorted(rules, key=lambda item: item.priority):
             if not self.should_execute(rule) or not self.evaluate_condition(rule.trigger):
                 continue
-            completed = True
+            outcomes: list[ActionOutcome] = []
             for action in rule.actions:
-                completed = await self.execute_action(action) and completed
+                outcomes.append(await self.execute_action(action))
             self._last_rule_execution[rule.id] = self.time
-            if completed and rule.execution == ExecutionPolicy.ONCE:
+            if once_rule_completed(rule, outcomes):
                 self._completed_rules.add(rule.id)
 
     async def _accept_opponent_surrender(self) -> bool:
@@ -212,25 +326,15 @@ class DeclarativeBot(BotAI):
         )
 
     def should_execute(self, rule: StrategyRule) -> bool:
-        if rule.execution == ExecutionPolicy.ONCE:
-            return rule.id not in self._completed_rules
-        if rule.execution == ExecutionPolicy.COOLDOWN:
-            last_execution = self._last_rule_execution.get(rule.id)
-            return last_execution is None or self.time - last_execution >= rule.cooldown_seconds
-        return True
+        return rule_eligibility(
+            rule,
+            now=self.time,
+            completed_rules=self._completed_rules,
+            last_execution=self._last_rule_execution,
+        ).allowed
 
     def evaluate_condition(self, condition: Condition) -> bool:
-        if condition.kind == ConditionKind.ALWAYS:
-            return True
-        if condition.kind == ConditionKind.ALL:
-            return all(self.evaluate_condition(child) for child in condition.children)
-        if condition.kind == ConditionKind.ANY:
-            return any(self.evaluate_condition(child) for child in condition.children)
-        if condition.kind == ConditionKind.NOT:
-            return not self.evaluate_condition(condition.children[0])
-
-        value = self.metric_value(condition)
-        return compare(value, condition.comparator, condition.value)
+        return condition_matches(condition, self.metric_value)
 
     def metric_value(self, condition: Condition) -> float:
         metric = condition.metric
@@ -258,111 +362,152 @@ class DeclarativeBot(BotAI):
                 return self.structures(structure).ready.amount
             if condition.status == "pending":
                 return self.already_pending(structure)
-            return self.structures(structure).amount + self.already_pending(structure)
+            return (
+                self.structures(structure).ready.amount
+                + self.already_pending(structure)
+            )
         return 0
 
-    async def execute_action(self, action: StrategyAction) -> bool:
-        handlers = {
-            ActionType.DISTRIBUTE_WORKERS: self._distribute_workers,
-            ActionType.TRAIN_WORKERS: self._train_workers,
-            ActionType.MAINTAIN_SUPPLY: self._maintain_supply,
-            ActionType.BUILD_STRUCTURE: self._build_structure,
-            ActionType.MAINTAIN_GAS: self._maintain_gas,
-            ActionType.TRAIN_UNITS: self._train_units,
-            ActionType.EXPAND: self._expand,
-            ActionType.ATTACK: self._attack,
-            ActionType.BUILD_FORWARD: self._build_forward,
-            ActionType.EMERGENCY_WORKER_ATTACK: self._emergency_worker_attack,
-        }
-        return await handlers[action.type](action)
+    async def execute_action(self, action: StrategyAction) -> ActionOutcome:
+        handler_name = ACTION_SPECS[action.type].handler
+        handler = getattr(self, handler_name)
+        try:
+            return await handler(action)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{action.type.value} action failed: {exc}"
+            ) from exc
 
-    async def _distribute_workers(self, _action: StrategyAction) -> bool:
+    async def _distribute_workers(
+        self,
+        _action: StrategyAction,
+    ) -> ActionOutcome:
         await self.distribute_workers()
-        return True
+        return ActionOutcome.satisfied("worker distribution command issued")
 
-    async def _train_workers(self, action: StrategyAction) -> bool:
+    async def _train_workers(self, action: StrategyAction) -> ActionOutcome:
         assert action.amount is not None
-        if self.supply_workers >= action.amount:
-            return True
         worker = _unit_type(WORKER_BY_RACE[self.strategy.race].value)
-        trained = False
+        current = (
+            self.supply_workers
+            + self.already_pending(worker)
+            + self._scheduled_unit(worker)
+        )
+        completed = target_count_outcome(current, action.amount, "worker")
+        if completed:
+            return completed
+        remaining = max(1, int(action.amount - current))
+        trained = 0
         if self.strategy.race.value == "zerg":
             for larva in self.larva:
-                if self.supply_workers >= action.amount:
+                if trained >= remaining:
                     break
                 if self.can_afford(worker) and self.supply_left > 0:
                     larva.train(worker)
-                    trained = True
-            return trained
+                    self._mark_scheduled_unit(worker)
+                    trained += 1
+            if trained:
+                return ActionOutcome.progressed(
+                    f"scheduled {trained} worker(s)"
+                )
+            return ActionOutcome.blocked("no affordable larva is available for a worker")
         for townhall in self.townhalls.ready.idle:
+            if trained >= remaining:
+                break
             if self.can_afford(worker) and self.supply_left > 0:
                 townhall.train(worker)
-                trained = True
-        return trained
+                self._mark_scheduled_unit(worker)
+                trained += 1
+        if trained:
+            return ActionOutcome.progressed(f"scheduled {trained} worker(s)")
+        return ActionOutcome.blocked("no affordable idle town hall can train a worker")
 
-    async def _maintain_supply(self, action: StrategyAction) -> bool:
+    async def _maintain_supply(self, action: StrategyAction) -> ActionOutcome:
         assert action.buffer is not None
-        if self.supply_cap >= self.strategy.settings.max_supply or self.supply_left >= action.buffer:
-            return True
+        if self.supply_cap >= self.strategy.settings.max_supply:
+            return ActionOutcome.satisfied("maximum supply reached")
+        if self.supply_left >= action.buffer:
+            return ActionOutcome.satisfied("free-supply buffer is healthy")
         provider = SUPPLY_BY_RACE[self.strategy.race]
         provider_type = _unit_type(provider.value)
-        if self.already_pending(provider_type) + self._scheduled(provider_type) > 0:
-            return True
+        if (
+            self.already_pending(provider_type)
+            + self._scheduled_entity(provider_type)
+            > 0
+        ):
+            return ActionOutcome.progressed("supply provider is already pending")
         if not self.can_afford(provider_type):
-            return False
+            return ActionOutcome.blocked("cannot afford a supply provider")
         if self.strategy.race.value == "zerg":
             if self.larva:
                 self.larva.first.train(provider_type)
-                self._mark_scheduled(provider_type)
-                return True
-            return False
-        built = await self.build_structure_near_main(provider_type, action.distance)
+                self._mark_scheduled_unit(provider_type)
+                return ActionOutcome.progressed("scheduled a supply provider")
+            return ActionOutcome.blocked("no larva is available for a supply provider")
+        built = await self.build_structure_near_main(
+            provider_type,
+            DEFAULT_SUPPLY_BUILD_DISTANCE,
+        )
         if built:
-            self._mark_scheduled(provider_type)
-        return built
+            self._mark_scheduled_structure(provider_type)
+            return ActionOutcome.progressed("scheduled a supply structure")
+        return ActionOutcome.blocked("no valid worker or placement for supply")
 
-    async def _build_structure(self, action: StrategyAction) -> bool:
+    async def _build_structure(self, action: StrategyAction) -> ActionOutcome:
         assert action.structure is not None and action.amount is not None
         structure = _unit_type(action.structure.value)
-        current = (
-            self.structures(structure).amount
-            + self.already_pending(structure)
-            + self._scheduled(structure)
+        current = self._structure_total(structure)
+        completed = target_count_outcome(
+            current,
+            action.amount,
+            action.structure.value,
         )
-        if current >= action.amount:
-            return True
+        if completed:
+            return completed
         if not self.can_afford(structure):
-            return False
-        built = await self.build_structure_near_main(structure, action.distance)
+            return ActionOutcome.blocked(
+                f"cannot afford {action.structure.value}"
+            )
+        distance = self._action_value(action, "distance")
+        built = await self.build_structure_near_main(structure, distance)
         if built:
-            self._mark_scheduled(structure)
-        return built
-
-    async def _maintain_gas(self, action: StrategyAction) -> bool:
-        assert action.amount is not None
-        structure_name = action.structure or GAS_BY_RACE[self.strategy.race]
-        structure = _unit_type(structure_name.value)
-        current = (
-            self.gas_buildings.amount
-            + self.already_pending(structure)
-            + self._scheduled(structure)
+            self._mark_scheduled_structure(structure)
+            return ActionOutcome.progressed(
+                f"scheduled {action.structure.value}"
+            )
+        return ActionOutcome.blocked(
+            f"no valid worker or placement for {action.structure.value}"
         )
-        if current >= action.amount:
-            return True
+
+    async def _maintain_gas(self, action: StrategyAction) -> ActionOutcome:
+        assert action.structure is not None and action.amount is not None
+        structure = _unit_type(action.structure.value)
+        current = self._structure_total(structure)
+        completed = target_count_outcome(
+            current,
+            action.amount,
+            action.structure.value,
+        )
+        if completed:
+            return completed
         for townhall in self.townhalls.ready:
             for geyser in self.vespene_geyser.closer_than(10, townhall):
                 if self.gas_buildings.closer_than(1, geyser):
                     continue
                 if not self.can_afford(structure):
-                    return False
+                    return ActionOutcome.blocked(
+                        f"cannot afford {action.structure.value}"
+                    )
                 worker = self.select_build_worker(geyser.position)
                 if worker:
                     worker.build_gas(geyser)
-                    self._mark_scheduled(structure)
-                    return True
-        return False
+                    self._mark_scheduled_structure(structure)
+                    return ActionOutcome.progressed(
+                        f"scheduled {action.structure.value}"
+                    )
+        return ActionOutcome.blocked("no free geyser and worker are available")
 
-    async def _train_units(self, action: StrategyAction) -> bool:
+    async def _train_units(self, action: StrategyAction) -> ActionOutcome:
         requested = ([action.unit] if action.unit else action.units) + action.fallback_units
         for unit_name in requested:
             if unit_name is None:
@@ -370,99 +515,223 @@ class DeclarativeBot(BotAI):
             unit = _unit_type(unit_name.value)
             if not self.can_afford(unit) or self.supply_left <= 0:
                 continue
-            try:
-                if self.tech_requirement_progress(unit) < 1:
-                    continue
-            except Exception:
-                pass
+            if self.tech_requirement_progress(unit) < 1:
+                continue
             producer_name = PRODUCER_BY_UNIT[unit_name]
             if producer_name is None:
-                trained = False
+                trained = 0
                 for larva in self.larva:
                     if self.can_afford(unit) and self.supply_left > 0:
                         larva.train(unit)
-                        trained = True
+                        self._mark_scheduled_unit(unit)
+                        trained += 1
                 if trained:
-                    return True
+                    return ActionOutcome.satisfied(
+                        f"scheduled {trained} {unit_name.value}"
+                    )
                 continue
             producer = _unit_type(producer_name.value)
-            trained = False
+            trained = 0
             for building in self.structures(producer).ready.idle:
                 if self.can_afford(unit) and self.supply_left > 0:
                     building.train(unit)
-                    trained = True
+                    self._mark_scheduled_unit(unit)
+                    trained += 1
             if trained:
-                return True
-        return False
+                return ActionOutcome.satisfied(
+                    f"scheduled {trained} {unit_name.value}"
+                )
+        return ActionOutcome.blocked(
+            "no requested unit is affordable, eligible, and trainable"
+        )
 
-    async def _expand(self, action: StrategyAction) -> bool:
+    async def _expand(self, action: StrategyAction) -> ActionOutcome:
         assert action.structure is not None and action.amount is not None
         townhall = _unit_type(action.structure.value)
-        if (
-            self.townhalls.amount
+        current = (
+            self.townhalls.ready.amount
             + self.already_pending(townhall)
-            + self._scheduled(townhall)
-            >= action.amount
-        ):
-            return True
+            + self._scheduled_structure(townhall)
+        )
+        completed = target_count_outcome(current, action.amount, "town hall")
+        if completed:
+            return completed
         if not self.can_afford(townhall):
-            return False
-        await self.expand_now()
-        self._mark_scheduled(townhall)
-        return True
+            return ActionOutcome.blocked(
+                f"cannot afford {action.structure.value}"
+            )
+        location = await self.get_next_expansion()
+        if location is None:
+            return ActionOutcome.blocked("no reachable expansion location remains")
+        built = await self.build(
+            townhall,
+            near=location,
+            max_distance=10,
+            random_alternative=False,
+            placement_step=1,
+        )
+        if not built:
+            return ActionOutcome.blocked("could not place or schedule the expansion")
+        self._mark_scheduled_structure(townhall)
+        return ActionOutcome.progressed("scheduled a new town hall")
 
-    async def _attack(self, action: StrategyAction) -> bool:
+    async def _attack(self, action: StrategyAction) -> ActionOutcome:
         assert action.min_size is not None
         army = self._combine_units(_unit_type(unit.value) for unit in action.units)
         if action.required_unit and action.required_amount:
             required = self.units(_unit_type(action.required_unit.value)).amount
             if required < action.required_amount:
-                return False
+                return ActionOutcome.blocked(
+                    f"requires {action.required_amount} {action.required_unit.value}"
+                )
         if army.amount < action.min_size:
-            return False
+            return ActionOutcome.blocked(
+                f"army size is {army.amount}/{action.min_size}"
+            )
         target = self.choose_attack_target(army)
         for unit in army.idle:
             unit.attack(target)
-        return True
+        return ActionOutcome.satisfied("attack command issued")
 
-    async def _build_forward(self, action: StrategyAction) -> bool:
+    async def _build_forward(self, action: StrategyAction) -> ActionOutcome:
         assert action.structure is not None and action.amount is not None
         structure = _unit_type(action.structure.value)
         enemy_start = self.enemy_start_locations[0]
         forward_structures = self.structures(structure).closer_than(35, enemy_start)
-        if (
-            forward_structures.amount
-            + self.already_pending(structure)
-            + self._scheduled(structure)
-            >= action.amount
-        ):
-            return True
+        current = forward_structures.amount + self._scheduled_structure(structure)
+        completed = target_count_outcome(
+            current,
+            action.amount,
+            f"forward {action.structure.value}",
+        )
+        if completed:
+            return completed
+        if self.worker_en_route_to_build(structure) > 0:
+            return ActionOutcome.progressed(
+                f"a worker is en route to build {action.structure.value}"
+            )
         if not self.can_afford(structure):
-            return False
+            return ActionOutcome.blocked(
+                f"cannot afford {action.structure.value}"
+            )
 
-        anchor = enemy_start.towards(self.game_info.map_center, action.distance)
-        if action.structure.value == "PHOTONCANNON":
+        distance = self._action_value(action, "distance")
+        anchor = enemy_start.towards(self.game_info.map_center, distance)
+        if action.structure.value in {"PHOTONCANNON", "GATEWAY"}:
             pylons = self.structures(UnitTypeId.PYLON).ready.closer_than(35, enemy_start)
             if not pylons:
-                return False
+                return ActionOutcome.blocked(
+                    f"a forward PYLON is required for {action.structure.value}"
+                )
             anchor = pylons.closest_to(enemy_start).position
-        elif action.structure.value == "BUNKER":
-            depots = self.structures(UnitTypeId.SUPPLYDEPOT).ready.closer_than(35, enemy_start)
-            if not depots:
-                return False
-            anchor = depots.closest_to(enemy_start).position
         built = await self.build_structure_near_position(structure, anchor)
         if built:
-            self._mark_scheduled(structure)
-        return built
+            self._mark_scheduled_structure(structure)
+            return ActionOutcome.progressed(
+                f"scheduled forward {action.structure.value}"
+            )
+        return ActionOutcome.blocked(
+            f"no valid forward placement for {action.structure.value}"
+        )
 
-    async def _emergency_worker_attack(self, _action: StrategyAction) -> bool:
+    async def _emergency_worker_attack(
+        self,
+        _action: StrategyAction,
+    ) -> ActionOutcome:
         if self.townhalls:
-            return False
+            return ActionOutcome.blocked("a town hall still survives")
+        if not self.workers:
+            return ActionOutcome.satisfied("no workers remain")
         target = self.choose_attack_target(self.workers)
         for worker in self.workers:
             worker.attack(target)
-        return True
+        return ActionOutcome.satisfied("emergency worker attack issued")
+
+    async def _scout(self, action: StrategyAction) -> ActionOutcome:
+        assert action.unit is not None
+        scouts = self.units(_unit_type(action.unit.value))
+        if not scouts:
+            return ActionOutcome.blocked(f"no {action.unit.value} is available")
+        target_name = self._action_value(action, "target")
+        target = self.resolve_target_position(target_name, scouts.center)
+        scout = scouts.closest_to(target)
+        scout.move(target)
+        return ActionOutcome.satisfied(
+            f"{action.unit.value} scout sent to {target_name.value}"
+        )
+
+    async def _defend(self, action: StrategyAction) -> ActionOutcome:
+        assert action.min_size is not None
+        defenders = self._combine_units(
+            _unit_type(unit.value) for unit in action.units
+        )
+        if defenders.amount < action.min_size:
+            return ActionOutcome.blocked(
+                f"defender count is {defenders.amount}/{action.min_size}"
+            )
+        target_name = self._action_value(action, "target")
+        anchor = self.resolve_target_position(target_name, defenders.center)
+        radius = self._action_value(action, "distance")
+        threats = self.enemy_units.closer_than(radius, anchor)
+        if threats:
+            target = threats.closest_to(anchor)
+            for defender in defenders:
+                defender.attack(target)
+            return ActionOutcome.satisfied("defenders engaged a nearby threat")
+        for defender in defenders.idle.further_than(6, anchor):
+            defender.move(anchor)
+        return ActionOutcome.satisfied("defensive posture established")
+
+    async def _retreat(self, action: StrategyAction) -> ActionOutcome:
+        assert action.health_threshold is not None
+        selected = self._combine_units(
+            _unit_type(unit.value) for unit in action.units
+        )
+        wounded = selected.filter(
+            lambda unit: unit.shield_health_percentage
+            <= action.health_threshold
+        )
+        if not wounded:
+            return ActionOutcome.satisfied("no selected unit needs to retreat")
+        target_name = self._action_value(action, "target")
+        anchor = self.resolve_target_position(target_name, wounded.center)
+        for unit in wounded:
+            unit.move(anchor)
+        return ActionOutcome.satisfied(
+            f"retreated {wounded.amount} wounded unit(s)"
+        )
+
+    async def _research(self, action: StrategyAction) -> ActionOutcome:
+        assert action.upgrade is not None
+        upgrade = _upgrade_type(action.upgrade.value)
+        progress = self.already_pending_upgrade(upgrade)
+        if progress >= 1:
+            return ActionOutcome.satisfied(
+                f"{action.upgrade.value} is complete"
+            )
+        if progress > 0 or upgrade in self._scheduled_upgrades:
+            return ActionOutcome.progressed(
+                f"{action.upgrade.value} is in progress"
+            )
+        if not self.can_afford(upgrade):
+            return ActionOutcome.blocked(
+                f"cannot afford {action.upgrade.value}"
+            )
+        producer_name = PRODUCER_BY_UPGRADE[action.upgrade]
+        producers = self.structures(_unit_type(producer_name.value)).ready.idle
+        if not producers:
+            return ActionOutcome.blocked(
+                f"an idle {producer_name.value} is required"
+            )
+        command = producers.first.research(upgrade)
+        if not command:
+            return ActionOutcome.blocked(
+                f"{producer_name.value} cannot research {action.upgrade.value}"
+            )
+        self._scheduled_upgrades.add(upgrade)
+        return ActionOutcome.progressed(
+            f"started {action.upgrade.value} at {producer_name.value}"
+        )
 
     def _combine_units(self, unit_types: Iterable[UnitTypeId]) -> Units:
         army = Units([], self)
@@ -470,11 +739,41 @@ class DeclarativeBot(BotAI):
             army = army | self.units(unit_type)
         return army
 
-    def _scheduled(self, structure: UnitTypeId) -> int:
+    def _action_value(self, action: StrategyAction, field: str):
+        value = getattr(action, field)
+        if value is not None:
+            return value
+        defaults = ACTION_SPECS[action.type].defaults_by_race[self.strategy.race]
+        if field not in defaults:
+            raise RuntimeError(
+                f"{action.type.value}.{field} has no value or contract default"
+            )
+        return defaults[field]
+
+    def _scheduled_structure(self, structure: UnitTypeId) -> int:
         return self._scheduled_structures.get(structure, 0)
 
-    def _mark_scheduled(self, structure: UnitTypeId) -> None:
-        self._scheduled_structures[structure] = self._scheduled(structure) + 1
+    def _mark_scheduled_structure(self, structure: UnitTypeId) -> None:
+        self._scheduled_structures[structure] = (
+            self._scheduled_structure(structure) + 1
+        )
+
+    def _scheduled_unit(self, unit: UnitTypeId) -> int:
+        return self._scheduled_units.get(unit, 0)
+
+    def _mark_scheduled_unit(self, unit: UnitTypeId) -> None:
+        self._scheduled_units[unit] = self._scheduled_unit(unit) + 1
+
+    def _scheduled_entity(self, entity: UnitTypeId) -> int:
+        return self._scheduled_structure(entity) + self._scheduled_unit(entity)
+
+    def _structure_total(self, structure: UnitTypeId) -> float:
+        """Count completed, pending, and same-frame scheduled structures once."""
+        return (
+            self.structures(structure).ready.amount
+            + self.already_pending(structure)
+            + self._scheduled_structure(structure)
+        )
 
     def choose_attack_target(self, army: Units):
         if self.enemy_units:
@@ -492,6 +791,28 @@ class DeclarativeBot(BotAI):
             candidates,
             self._scouted_expansions,
             army.center,
+        )
+
+    def resolve_target_position(self, target: TargetLocation, reference):
+        if target == TargetLocation.MAP_CENTER:
+            return self.game_info.map_center
+        if target == TargetLocation.ENEMY_START:
+            return self.enemy_start_locations[0]
+        if target == TargetLocation.MAIN:
+            if self.townhalls:
+                return self.townhalls.first.position
+            return self.game_info.player_start_location
+        candidates = [
+            position
+            for position in self.expansion_locations_list
+            if not self.townhalls.closer_than(8, position)
+        ]
+        if not candidates:
+            return self.enemy_start_locations[0]
+        return least_recently_scouted_position(
+            candidates,
+            self._scouted_expansions,
+            reference,
         )
 
     @staticmethod

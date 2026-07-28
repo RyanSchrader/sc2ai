@@ -69,6 +69,27 @@ def test_zerg_basic_swarm_fixture_ships_roach_transition():
     assert rules["attack"].actions[0].min_size == 24
 
 
+def test_ryan_zealot_rush_fixture_preserves_legacy_intent():
+    records = json.loads(FIXTURES.read_text())
+    record = next(record for record in records if record["slug"] == "ryan-zealot-rush")
+    strategy = StrategyDocument.model_validate(record["strategy"])
+    rules = {
+        rule.id: rule
+        for phase in strategy.phases
+        for rule in phase.rules
+    }
+
+    assert strategy.opening_chat == "(glhf)"
+    assert rules["workers"].actions[0].amount == 16
+    assert rules["supply"].actions[0].buffer == 4
+    assert rules["four-gates"].actions[0].structure.value == "GATEWAY"
+    assert rules["four-gates"].actions[0].amount == 4
+    assert rules["zealots"].actions[0].unit.value == "ZEALOT"
+    assert rules["attack"].actions[0].units == ["ZEALOT"]
+    assert rules["attack"].actions[0].min_size == 8
+    assert rules["last-stand"].actions[0].type == ActionType.EMERGENCY_WORKER_ATTACK
+
+
 def test_cross_race_action_is_rejected():
     strategy = blank_strategy(RaceName.PROTOSS)
     strategy.phases[0].rules[0].actions = [

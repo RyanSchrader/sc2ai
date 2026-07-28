@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { api, jsonOptions } from "../api";
 import {
   alwaysCondition,
+  shortDigest,
   summarizeAction,
   summarizeCondition,
+  type ActionFieldSpec,
   type BotRecord,
   type BotSummary,
   type Catalog,
@@ -25,6 +27,7 @@ interface Props {
 interface Revision {
   id: string;
   number: number;
+  content_digest?: string;
   summary: string;
   created_at: string;
 }
@@ -136,17 +139,18 @@ export default function BotEditor({ botId, catalog, onBack, onRun }: Props) {
   };
 
   const addRule = (phaseIndex: number) => {
+    if (!catalog || !draft) return;
     updateDraft((next) => {
       const phase = next.strategy.phases[phaseIndex];
+      const type = actionTypesForRace(catalog, next.race)[0] ?? "distribute_workers";
       phase.rules.push({
         id: crypto.randomUUID(),
         name: "New rule",
         enabled: true,
         priority: (phase.rules.length + 1) * 10,
         execution: "continuous",
-        cooldown_seconds: 1,
         trigger: alwaysCondition(),
-        actions: [{ type: "distribute_workers" }],
+        actions: [defaultActionFor(catalog, next.race, type)],
       });
       setSelected({ phase: phaseIndex, rule: phase.rules.length - 1 });
     });
@@ -227,6 +231,12 @@ export default function BotEditor({ botId, catalog, onBack, onRun }: Props) {
           />
           <span>
             {draft.race} · revision {bot.currentRevision}
+            {shortDigest(bot.currentRevisionDigest) && (
+              <span title={`Content digest ${bot.currentRevisionDigest}`}>
+                {" "}
+                · {shortDigest(bot.currentRevisionDigest)}
+              </span>
+            )}
             {dirty && <b className="unsaved"> · unsaved</b>}
           </span>
         </div>
@@ -355,7 +365,12 @@ export default function BotEditor({ botId, catalog, onBack, onRun }: Props) {
                   onClick={() => void restoreRevision(revision.number)}
                 >
                   <strong>v{revision.number}</strong>
-                  <span>{revision.summary}</span>
+                  <span title={revision.content_digest ?? undefined}>
+                    {revision.summary}
+                    {shortDigest(revision.content_digest)
+                      ? ` · ${shortDigest(revision.content_digest)}`
+                      : ""}
+                  </span>
                 </button>
               ))}
             </div>
@@ -563,10 +578,15 @@ function RuleInspector({
           <select
             value={rule.execution}
             onChange={(event) =>
-              update(
-                (next) =>
-                  (next.execution = event.target.value as StrategyRule["execution"]),
-              )
+              update((next) => {
+                const execution = event.target.value as StrategyRule["execution"];
+                next.execution = execution;
+                if (execution === "cooldown") {
+                  next.cooldown_seconds = Math.max(0.1, next.cooldown_seconds ?? 1);
+                } else {
+                  delete next.cooldown_seconds;
+                }
+              })
             }
           >
             {catalog.executionPolicies.map((policy) => (
@@ -582,7 +602,7 @@ function RuleInspector({
             type="number"
             min="0.1"
             step="0.1"
-            value={rule.cooldown_seconds}
+            value={rule.cooldown_seconds ?? 1}
             onChange={(event) =>
               update((next) => (next.cooldown_seconds = Number(event.target.value)))
             }
@@ -652,9 +672,12 @@ function RuleInspector({
           ))}
           <button
             className="add-action"
-            onClick={() =>
-              update((next) => next.actions.push({ type: "distribute_workers" }))
-            }
+            onClick={() => {
+              const type = actionTypesForRace(catalog, race)[0] ?? "distribute_workers";
+              update((next) =>
+                next.actions.push(defaultActionFor(catalog, race, type)),
+              );
+            }}
           >
             + Add action
           </button>
@@ -667,7 +690,7 @@ function RuleInspector({
   );
 }
 
-function ConditionEditor({
+export function ConditionEditor({
   condition,
   catalog,
   race,
@@ -688,31 +711,37 @@ function ConditionEditor({
   const subjectOptions =
     condition.metric === "structure_count"
       ? catalog.structures[race]
-      : catalog.units[race];
+      : condition.metric === "enemy_unit_count"
+        ? [...new Set(Object.values(catalog.units).flat())].sort()
+        : catalog.units[race];
   const needsSubject = ["unit_count", "structure_count", "enemy_unit_count"].includes(
     condition.metric ?? "",
   );
 
   const setKind = (kind: ConditionKind) => {
-    const next: Condition = {
-      kind,
-      comparator: "gte",
-      value: 0,
-      status: "total",
-      children:
-        kind === "not"
-          ? [alwaysCondition()]
-          : kind === "all" || kind === "any"
-            ? [alwaysCondition(), alwaysCondition()]
-            : [],
-    };
-    if (kind === "metric") next.metric = "workers";
-    onChange(next);
+    if (kind === "always") {
+      onChange(alwaysCondition());
+    } else if (kind === "not") {
+      onChange({ kind, children: [alwaysCondition()] });
+    } else if (kind === "all" || kind === "any") {
+      onChange({ kind, children: [alwaysCondition(), alwaysCondition()] });
+    } else {
+      onChange({
+        kind,
+        metric: "workers",
+        comparator: "gte",
+        value: 0,
+      });
+    }
   };
 
   return (
     <div className={`condition-editor depth-${Math.min(depth, 2)}`}>
-      <select value={condition.kind} onChange={(event) => setKind(event.target.value as ConditionKind)}>
+      <select
+        aria-label="Condition kind"
+        value={condition.kind}
+        onChange={(event) => setKind(event.target.value as ConditionKind)}
+      >
         {catalog.conditionKinds.map((kind) => (
           <option key={kind}>{kind}</option>
         ))}
@@ -720,11 +749,16 @@ function ConditionEditor({
       {condition.kind === "metric" && (
         <>
           <select
+            aria-label="Metric"
             value={condition.metric ?? "workers"}
             onChange={(event) =>
               update((next) => {
                 next.metric = event.target.value;
-                next.subject = null;
+                delete next.subject;
+                delete next.status;
+                if (event.target.value === "structure_count") {
+                  next.status = "total";
+                }
               })
             }
           >
@@ -734,8 +768,17 @@ function ConditionEditor({
           </select>
           {needsSubject && (
             <select
+              aria-label="Subject"
               value={condition.subject ?? ""}
-              onChange={(event) => update((next) => (next.subject = event.target.value))}
+              onChange={(event) =>
+                update((next) => {
+                  if (event.target.value) {
+                    next.subject = event.target.value;
+                  } else {
+                    delete next.subject;
+                  }
+                })
+              }
             >
               <option value="">Select subject</option>
               {subjectOptions.map((subject) => (
@@ -745,6 +788,7 @@ function ConditionEditor({
           )}
           {condition.metric === "structure_count" && (
             <select
+              aria-label="Structure status"
               value={condition.status ?? "total"}
               onChange={(event) =>
                 update(
@@ -760,6 +804,7 @@ function ConditionEditor({
           )}
           <div className="condition-comparison">
             <select
+              aria-label="Comparator"
               value={condition.comparator ?? "gte"}
               onChange={(event) =>
                 update(
@@ -773,6 +818,7 @@ function ConditionEditor({
               ))}
             </select>
             <input
+              aria-label="Comparison value"
               type="number"
               value={condition.value ?? 0}
               onChange={(event) => update((next) => (next.value = Number(event.target.value)))}
@@ -825,7 +871,94 @@ function ConditionEditor({
   );
 }
 
-function ActionEditor({
+function actionTypesForRace(catalog: Catalog, race: BotRecord["race"]): string[] {
+  return catalog.actionTypes.filter((type) =>
+    catalog.actionSpecs[type]?.races.includes(race),
+  );
+}
+
+function defaultActionFor(
+  catalog: Catalog,
+  race: BotRecord["race"],
+  type: string,
+): StrategyAction {
+  return structuredClone(catalog.actionSpecs[type]?.defaultsByRace[race] ?? { type });
+}
+
+function hasAllowedRole(entityRoles: string[], allowedRoles: string[] | undefined): boolean {
+  return !allowedRoles?.length || allowedRoles.some((role) => entityRoles.includes(role));
+}
+
+function unitOptionsForField(
+  catalog: Catalog,
+  race: BotRecord["race"],
+  field: ActionFieldSpec,
+  action: StrategyAction,
+): string[] {
+  let options = catalog.units[race].filter((unit) => {
+    const metadata = catalog.unitMetadata[unit];
+    return (
+      metadata?.race === race &&
+      hasAllowedRole(metadata.roles, field.unitRoles)
+    );
+  });
+
+  if (field.name === "fallback_units") {
+    const primary = new Set([
+      ...(action.unit ? [action.unit] : []),
+      ...(action.units ?? []),
+    ]);
+    options = options.filter((unit) => !primary.has(unit));
+  }
+
+  if (field.name === "required_unit" && action.type === "attack") {
+    const army = new Set(action.units ?? []);
+    options = options.filter((unit) => army.has(unit));
+  }
+
+  return options;
+}
+
+function structureOptionsForField(
+  catalog: Catalog,
+  race: BotRecord["race"],
+  field: ActionFieldSpec,
+): string[] {
+  return catalog.structures[race].filter((structure) => {
+    const metadata = catalog.structureMetadata[structure];
+    return (
+      metadata?.race === race &&
+      hasAllowedRole(metadata.roles, field.structureRoles)
+    );
+  });
+}
+
+const ACTION_FIELD_LABELS: Record<string, string> = {
+  amount: "Target count",
+  buffer: "Supply buffer",
+  distance: "Distance",
+  fallback_units: "Fallback units",
+  health_threshold: "Health threshold",
+  min_size: "Minimum army size",
+  required_amount: "Required count",
+  required_unit: "Required unit",
+  structure: "Structure",
+  target: "Destination",
+  unit: "Primary unit",
+  units: "Army units",
+  upgrade: "Upgrade",
+};
+
+function fieldLabel(name: string): string {
+  return ACTION_FIELD_LABELS[name] ?? formatCatalogValue(name);
+}
+
+function formatCatalogValue(value: string): string {
+  const words = value.replaceAll("_", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+export function ActionEditor({
   action,
   catalog,
   race,
@@ -843,185 +976,260 @@ function ActionEditor({
     mutate(next);
     onChange(next);
   };
-  const actionDefaults = (type: string): StrategyAction => {
-    const unit = catalog.units[race][0];
-    const structure = catalog.structures[race][0];
-    if (type === "train_workers") return { type, amount: 50 };
-    if (type === "maintain_supply") return { type, buffer: 5 };
-    if (["build_structure", "maintain_gas", "build_forward", "expand"].includes(type)) {
-      return { type, structure, amount: 1, distance: 7 };
-    }
-    if (type === "train_units") return { type, unit };
-    if (type === "attack") return { type, units: [unit], min_size: 10 };
-    return { type };
-  };
-  const hasStructure = ["build_structure", "maintain_gas", "build_forward", "expand"].includes(
-    action.type,
-  );
-  const hasAmount = ["train_workers", "build_structure", "maintain_gas", "build_forward", "expand"].includes(
-    action.type,
-  );
+  const availableTypes = actionTypesForRace(catalog, race);
+  const spec = catalog.actionSpecs[action.type];
+  const unsupportedCurrentType = !availableTypes.includes(action.type);
 
   return (
     <div className="action-editor">
       <div className="action-header">
-        <select value={action.type} onChange={(event) => onChange(actionDefaults(event.target.value))}>
-          {catalog.actionTypes.map((type) => (
-            <option key={type}>{type}</option>
+        <select
+          aria-label="Action type"
+          value={action.type}
+          onChange={(event) =>
+            onChange(defaultActionFor(catalog, race, event.target.value))
+          }
+        >
+          {unsupportedCurrentType && (
+            <option value={action.type} disabled>
+              {spec?.label ?? formatCatalogValue(action.type)} (unsupported for {race})
+            </option>
+          )}
+          {availableTypes.map((type) => (
+            <option key={type} value={type}>
+              {catalog.actionSpecs[type].label}
+            </option>
           ))}
         </select>
-        <button className="icon-button danger" onClick={onDelete}>
+        <button
+          aria-label={`Delete ${spec?.label ?? action.type} action`}
+          className="icon-button danger"
+          onClick={onDelete}
+        >
           ×
         </button>
       </div>
-      {action.type === "maintain_supply" && (
-        <label>
-          Supply buffer
-          <input
-            type="number"
-            min="0"
-            value={action.buffer ?? 0}
-            onChange={(event) => update((next) => (next.buffer = Number(event.target.value)))}
-          />
-        </label>
-      )}
-      {hasStructure && (
-        <label>
-          Structure
-          <select
-            value={action.structure ?? ""}
-            onChange={(event) => update((next) => (next.structure = event.target.value))}
-          >
-            {catalog.structures[race].map((structure) => (
-              <option key={structure}>{structure}</option>
-            ))}
-          </select>
-        </label>
-      )}
-      {hasAmount && (
-        <label>
-          Target count
-          <input
-            type="number"
-            min="0"
-            value={action.amount ?? 0}
-            onChange={(event) => update((next) => (next.amount = Number(event.target.value)))}
-          />
-        </label>
-      )}
-      {action.type === "train_units" && (
-        <>
-          <label>
-            Primary unit
-            <select
-              value={action.unit ?? ""}
-              onChange={(event) => update((next) => (next.unit = event.target.value))}
-            >
-              {catalog.units[race].map((unit) => (
-                <option key={unit}>{unit}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Fallback unit
-            <select
-              value={action.fallback_units?.[0] ?? ""}
-              onChange={(event) =>
-                update(
-                  (next) =>
-                    (next.fallback_units = event.target.value ? [event.target.value] : []),
-                )
-              }
-            >
-              <option value="">None</option>
-              {catalog.units[race].map((unit) => (
-                <option key={unit}>{unit}</option>
-              ))}
-            </select>
-          </label>
-        </>
-      )}
-      {action.type === "attack" && (
-        <>
-          <fieldset>
-            <legend>Army units</legend>
-            <div className="unit-checks">
-              {catalog.units[race].map((unit) => (
-                <label key={unit}>
-                  <input
-                    type="checkbox"
-                    checked={action.units?.includes(unit) ?? false}
-                    onChange={(event) =>
-                      update((next) => {
-                        const units = new Set(next.units ?? []);
-                        event.target.checked ? units.add(unit) : units.delete(unit);
-                        next.units = [...units];
-                      })
-                    }
-                  />
-                  {unit}
-                </label>
-              ))}
-            </div>
-          </fieldset>
-          <label>
-            Minimum army size
-            <input
-              type="number"
-              min="1"
-              value={action.min_size ?? 1}
-              onChange={(event) => update((next) => (next.min_size = Number(event.target.value)))}
-            />
-          </label>
-          <div className="form-grid">
-            <label>
-              Required unit
+      {spec?.description && <small>{spec.description}</small>}
+      {spec?.fields.map((field) => {
+        if (field.name === "required_amount" && !action.required_unit) return null;
+
+        if (field.kind === "unit_list") {
+          const options = unitOptionsForField(catalog, race, field, action);
+          const selected = Array.isArray(action[field.name])
+            ? (action[field.name] as string[])
+            : [];
+          return (
+            <fieldset key={field.name}>
+              <legend>{fieldLabel(field.name)}</legend>
+              <div className="unit-checks">
+                {options.map((unit) => (
+                  <label key={unit}>
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(unit)}
+                      onChange={(event) =>
+                        update((next) => {
+                          const values = new Set(
+                            Array.isArray(next[field.name])
+                              ? (next[field.name] as string[])
+                              : [],
+                          );
+                          event.target.checked ? values.add(unit) : values.delete(unit);
+                          next[field.name] = [...values];
+
+                          if (field.name === "units") {
+                            if (next.type === "train_units" && values.size) {
+                              delete next.unit;
+                            }
+                            next.fallback_units = (next.fallback_units ?? []).filter(
+                              (fallback) => !values.has(fallback),
+                            );
+                            if (
+                              next.required_unit &&
+                              !values.has(next.required_unit)
+                            ) {
+                              delete next.required_unit;
+                              delete next.required_amount;
+                            }
+                          }
+                        })
+                      }
+                    />
+                    {unit}
+                  </label>
+                ))}
+              </div>
+              {field.required && selected.length === 0 && (
+                <small>Choose at least one.</small>
+              )}
+            </fieldset>
+          );
+        }
+
+        if (field.kind === "unit") {
+          const options = unitOptionsForField(catalog, race, field, action);
+          const currentValue = action[field.name];
+          return (
+            <label key={field.name}>
+              {fieldLabel(field.name)}
               <select
-                value={action.required_unit ?? ""}
+                value={typeof currentValue === "string" ? currentValue : ""}
                 onChange={(event) =>
                   update((next) => {
-                    next.required_unit = event.target.value || null;
-                    next.required_amount = event.target.value
-                      ? Math.max(1, next.required_amount ?? 1)
-                      : null;
+                    const value = event.target.value;
+                    if (value) {
+                      next[field.name] = value;
+                    } else {
+                      delete next[field.name];
+                    }
+
+                    if (field.name === "unit" && next.type === "train_units" && value) {
+                      delete next.units;
+                      next.fallback_units = (next.fallback_units ?? []).filter(
+                        (fallback) => fallback !== value,
+                      );
+                    }
+                    if (field.name === "required_unit") {
+                      if (value) {
+                        next.required_amount = Math.max(1, next.required_amount ?? 1);
+                      } else {
+                        delete next.required_amount;
+                      }
+                    }
                   })
                 }
               >
-                <option value="">None</option>
-                {catalog.units[race].map((unit) => (
-                  <option key={unit}>{unit}</option>
+                <option value="">
+                  {field.required ? `Select ${fieldLabel(field.name).toLowerCase()}` : "None"}
+                </option>
+                {options.map((unit) => (
+                  <option key={unit} value={unit}>
+                    {unit}
+                  </option>
                 ))}
               </select>
             </label>
-            {action.required_unit && (
-              <label>
-                Required count
-                <input
-                  type="number"
-                  min="1"
-                  value={action.required_amount ?? 1}
-                  onChange={(event) =>
-                    update(
-                      (next) => (next.required_amount = Number(event.target.value)),
-                    )
+          );
+        }
+
+        if (field.kind === "structure") {
+          const options = structureOptionsForField(catalog, race, field);
+          const currentValue = action[field.name];
+          return (
+            <label key={field.name}>
+              {fieldLabel(field.name)}
+              <select
+                value={typeof currentValue === "string" ? currentValue : ""}
+                onChange={(event) =>
+                  update((next) => {
+                    if (event.target.value) {
+                      next[field.name] = event.target.value;
+                    } else {
+                      delete next[field.name];
+                    }
+                  })
+                }
+              >
+                <option value="">
+                  {field.required ? `Select ${fieldLabel(field.name).toLowerCase()}` : "None"}
+                </option>
+                {options.map((structure) => (
+                  <option key={structure} value={structure}>
+                    {structure}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        }
+
+        if (field.kind === "upgrade") {
+          const options = catalog.upgrades[race].filter(
+            (upgrade) => catalog.upgradeMetadata[upgrade]?.race === race,
+          );
+          const currentValue = action[field.name];
+          return (
+            <label key={field.name}>
+              {fieldLabel(field.name)}
+              <select
+                value={typeof currentValue === "string" ? currentValue : ""}
+                onChange={(event) =>
+                  update((next) => {
+                    if (event.target.value) {
+                      next[field.name] = event.target.value;
+                    } else {
+                      delete next[field.name];
+                    }
+                  })
+                }
+              >
+                <option value="">
+                  {field.required ? `Select ${fieldLabel(field.name).toLowerCase()}` : "None"}
+                </option>
+                {options.map((upgrade) => (
+                  <option key={upgrade} value={upgrade}>
+                    {formatCatalogValue(upgrade)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        }
+
+        if (field.kind === "target") {
+          const currentValue = action[field.name];
+          return (
+            <label key={field.name}>
+              {fieldLabel(field.name)}
+              <select
+                value={typeof currentValue === "string" ? currentValue : ""}
+                onChange={(event) =>
+                  update((next) => {
+                    if (event.target.value) {
+                      next[field.name] = event.target.value;
+                    } else {
+                      delete next[field.name];
+                    }
+                  })
+                }
+              >
+                {!field.required && <option value="">Default</option>}
+                {(field.targets ?? catalog.targets).map((target) => (
+                  <option key={target} value={target}>
+                    {formatCatalogValue(target)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        }
+
+        const currentValue = action[field.name];
+        const value = typeof currentValue === "number" ? currentValue : "";
+        const ratio = field.kind === "ratio";
+        return (
+          <label key={field.name}>
+            {fieldLabel(field.name)}
+            <input
+              type="number"
+              min={ratio ? 0.01 : field.kind === "integer" ? 1 : 0}
+              max={ratio ? 1 : 200}
+              step={ratio ? 0.05 : field.kind === "integer" ? 1 : 0.5}
+              value={value}
+              onChange={(event) =>
+                update((next) => {
+                  if (event.target.value === "") {
+                    delete next[field.name];
+                  } else {
+                    next[field.name] = Number(event.target.value);
                   }
-                />
-              </label>
-            )}
-          </div>
-        </>
-      )}
-      {["build_structure", "build_forward"].includes(action.type) && (
-        <label>
-          Placement distance
-          <input
-            type="number"
-            min="0"
-            value={action.distance ?? 7}
-            onChange={(event) => update((next) => (next.distance = Number(event.target.value)))}
-          />
-        </label>
-      )}
+                })
+              }
+            />
+          </label>
+        );
+      })}
+      {!spec && <small>This action is not described by the current catalog.</small>}
     </div>
   );
 }
