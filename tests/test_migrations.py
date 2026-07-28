@@ -39,8 +39,10 @@ def _insert_legacy_bot(
     *,
     bot_id: str = "legacy-bot",
     revision_id: str = "legacy-revision",
+    strategy_json: str | None = None,
 ) -> tuple[str, str]:
-    strategy_json = blank_strategy(RaceName.TERRAN).model_dump_json()
+    if strategy_json is None:
+        strategy_json = blank_strategy(RaceName.TERRAN).model_dump_json()
     now = "2026-01-01T00:00:00+00:00"
     connection.execute(
         """
@@ -60,6 +62,41 @@ def _insert_legacy_bot(
         (revision_id, bot_id, strategy_json, now),
     )
     return strategy_json, revision_id
+
+
+def test_migrated_bot_with_zero_valued_legacy_action_remains_readable(
+    tmp_path: Path,
+):
+    database = tmp_path / "legacy-zero.db"
+    strategy = blank_strategy(RaceName.TERRAN).model_dump(mode="json")
+    strategy["phases"][0]["rules"][0]["actions"] = [
+        {
+            "type": "train_workers",
+            "unit": None,
+            "units": [],
+            "fallback_units": [],
+            "structure": None,
+            "amount": 0,
+            "buffer": None,
+            "distance": 7.0,
+            "placement": "main",
+            "min_size": None,
+            "required_unit": None,
+            "required_amount": None,
+            "target": "enemy_start",
+        }
+    ]
+    with _connect(database) as connection:
+        apply_migrations(connection, target_version=1)
+        _insert_legacy_bot(connection, strategy_json=json.dumps(strategy))
+
+    repository = StudioRepository(database)
+    repository.initialize(seed=False)
+
+    bot = repository.get_bot("legacy-bot")
+    assert bot["strategy"]["phases"][0]["rules"][0]["actions"] == [
+        {"type": "train_workers", "amount": 0}
+    ]
 
 
 def test_empty_database_migrates_in_order_and_is_idempotent(tmp_path: Path):

@@ -237,8 +237,8 @@ class StrategyAction(StrategyModel):
     fallback_units: list[UnitName] = Field(default_factory=list, max_length=20)
     structure: StructureName | None = None
     upgrade: UpgradeName | None = None
-    amount: int | None = Field(default=None, ge=1, le=200)
-    buffer: int | None = Field(default=None, ge=1, le=200)
+    amount: int | None = Field(default=None, ge=0, le=200)
+    buffer: int | None = Field(default=None, ge=0, le=200)
     distance: float | None = Field(default=None, ge=0, le=200)
     min_size: int | None = Field(default=None, ge=1, le=200)
     required_unit: UnitName | None = None

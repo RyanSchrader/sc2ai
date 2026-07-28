@@ -235,6 +235,39 @@ def test_exact_legacy_expanded_action_shape_loads_and_normalizes():
     }
 
 
+@pytest.mark.parametrize(
+    ("action_type", "field"),
+    [
+        ("train_workers", "amount"),
+        ("maintain_supply", "buffer"),
+    ],
+)
+def test_zero_valued_legacy_action_setting_is_preserved(action_type, field):
+    legacy = {
+        "type": action_type,
+        "unit": None,
+        "units": [],
+        "fallback_units": [],
+        "structure": None,
+        "amount": None,
+        "buffer": None,
+        "distance": 7.0,
+        "placement": "main",
+        "min_size": None,
+        "required_unit": None,
+        "required_amount": None,
+        "target": "enemy_start",
+    }
+    legacy[field] = 0
+
+    action = StrategyAction.model_validate(legacy)
+
+    assert action.model_dump(mode="json") == {
+        "type": action_type,
+        field: 0,
+    }
+
+
 def test_partial_legacy_shape_does_not_silently_ignore_target():
     with pytest.raises(ValidationError, match="does not support fields: target"):
         StrategyAction.model_validate(
