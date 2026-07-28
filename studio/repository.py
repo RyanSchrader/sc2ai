@@ -10,6 +10,17 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
+from .migrations import (
+    LATEST_SCHEMA_VERSION,
+    MigrationReport,
+    apply_migrations,
+    canonical_json,
+    content_digest,
+    create_migration_backup,
+    current_schema_version,
+    has_legacy_application_schema,
+    pending_migrations,
+)
 from .models import (
     BenchmarkSuiteCreate,
     BotCreate,
@@ -43,6 +54,8 @@ class StudioRepository:
         configured = os.getenv("SC2_STUDIO_DB")
         selected = Path(database_path or configured or DEFAULT_DATA_DIR / "studio.db")
         self.database_path = selected if selected.is_absolute() else PROJECT_ROOT / selected
+        self.last_migration_backup: Path | None = None
+        self.last_migration_report: MigrationReport | None = None
 
     def connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,138 +67,15 @@ class StudioRepository:
 
     def initialize(self, seed: bool = True) -> None:
         with self.connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS bots (
-                    id TEXT PRIMARY KEY,
-                    slug TEXT NOT NULL UNIQUE,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    race TEXT NOT NULL,
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    is_builtin INTEGER NOT NULL DEFAULT 0,
-                    forked_from TEXT REFERENCES bots(id),
-                    deleted_at TEXT,
-                    current_revision INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS revisions (
-                    id TEXT PRIMARY KEY,
-                    bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
-                    number INTEGER NOT NULL,
-                    strategy_json TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE(bot_id, number)
-                );
-
-                CREATE TABLE IF NOT EXISTS proposals (
-                    id TEXT PRIMARY KEY,
-                    base_bot_id TEXT REFERENCES bots(id),
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    applied_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS matches (
-                    id TEXT PRIMARY KEY,
-                    source TEXT NOT NULL DEFAULT 'single',
-                    map_name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    game_time_seconds REAL,
-                    return_code INTEGER,
-                    failure_reason TEXT,
-                    regression_batch_id TEXT,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS match_participants (
-                    match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
-                    slot INTEGER NOT NULL,
-                    participant_type TEXT NOT NULL,
-                    bot_id TEXT REFERENCES bots(id),
-                    bot_revision INTEGER,
-                    name TEXT NOT NULL,
-                    requested_race TEXT NOT NULL,
-                    resolved_race TEXT,
-                    difficulty TEXT,
-                    result TEXT,
-                    PRIMARY KEY (match_id, slot)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_match_participants_bot
-                    ON match_participants(bot_id, match_id);
-                CREATE INDEX IF NOT EXISTS idx_matches_created
-                    ON matches(created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS benchmark_suites (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL DEFAULT '',
-                    archived_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS benchmark_scenarios (
-                    id TEXT PRIMARY KEY,
-                    suite_id TEXT NOT NULL REFERENCES benchmark_suites(id) ON DELETE CASCADE,
-                    position INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    map_name TEXT NOT NULL,
-                    opponent_type TEXT NOT NULL,
-                    enemy_race TEXT,
-                    difficulty TEXT,
-                    opponent_bot_id TEXT REFERENCES bots(id),
-                    opponent_revision INTEGER,
-                    UNIQUE(suite_id, position)
-                );
-
-                CREATE TABLE IF NOT EXISTS regression_batches (
-                    id TEXT PRIMARY KEY,
-                    bot_id TEXT NOT NULL REFERENCES bots(id),
-                    candidate_revision INTEGER NOT NULL,
-                    baseline_revision INTEGER NOT NULL,
-                    suite_id TEXT REFERENCES benchmark_suites(id),
-                    suite_name TEXT NOT NULL,
-                    games_per_scenario INTEGER NOT NULL,
-                    concurrency INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    total_games INTEGER NOT NULL,
-                    completed_games INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS regression_games (
-                    id TEXT PRIMARY KEY,
-                    batch_id TEXT NOT NULL REFERENCES regression_batches(id) ON DELETE CASCADE,
-                    scenario_position INTEGER NOT NULL,
-                    scenario_name TEXT NOT NULL,
-                    map_name TEXT NOT NULL,
-                    opponent_type TEXT NOT NULL,
-                    enemy_race TEXT,
-                    difficulty TEXT,
-                    opponent_bot_id TEXT REFERENCES bots(id),
-                    opponent_revision INTEGER,
-                    tested_role TEXT NOT NULL,
-                    tested_revision INTEGER NOT NULL,
-                    repetition INTEGER NOT NULL,
-                    random_seed INTEGER NOT NULL,
-                    match_id TEXT REFERENCES matches(id),
-                    status TEXT NOT NULL DEFAULT 'queued'
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_regression_games_batch
-                    ON regression_games(batch_id, status, scenario_position, repetition);
-                """
-            )
+            migrations = pending_migrations(connection)
+            if migrations and has_legacy_application_schema(connection):
+                self.last_migration_backup = create_migration_backup(
+                    connection,
+                    self.database_path,
+                    from_version=current_schema_version(connection),
+                    to_version=LATEST_SCHEMA_VERSION,
+                )
+            self.last_migration_report = apply_migrations(connection)
             connection.execute(
                 """
                 UPDATE regression_batches
@@ -205,12 +95,16 @@ class StudioRepository:
             strategy = StrategyDocument.model_validate(fixture["strategy"])
             with self.connect() as connection:
                 exists = connection.execute(
-                    "SELECT id, is_builtin, current_revision FROM bots WHERE slug = ?",
+                    """
+                    SELECT id, is_builtin, current_revision,
+                        current_revision_id, builtin_revision_id
+                    FROM bots WHERE slug = ?
+                    """,
                     (fixture["slug"],),
                 ).fetchone()
             if exists:
-                if exists["is_builtin"] and exists["current_revision"] == 1:
-                    self._refresh_pristine_builtin(exists["id"], fixture, strategy)
+                if exists["is_builtin"]:
+                    self._synchronize_builtin(exists["id"], fixture, strategy)
                 continue
             self.create_bot(
                 BotCreate(
@@ -225,46 +119,111 @@ class StudioRepository:
                 summary="Imported built-in strategy",
             )
 
-    def _refresh_pristine_builtin(
+    def _synchronize_builtin(
         self,
         bot_id: str,
         fixture: dict[str, Any],
         strategy: StrategyDocument,
     ) -> None:
-        """Keep untouched seed records aligned with their checked-in fixture."""
-        serialized = strategy.model_dump_json()
+        """Append fixture changes while leaving user-modified built-ins alone."""
+        serialized = canonical_json(strategy.model_dump(mode="json"))
+        digest = content_digest(serialized)
         with self.connect() as connection:
-            revision = connection.execute(
-                "SELECT strategy_json FROM revisions WHERE bot_id = ? AND number = 1",
+            connection.execute("BEGIN IMMEDIATE")
+            bot = connection.execute(
+                """
+                SELECT bots.*, revisions.id AS resolved_revision_id,
+                    revisions.content_digest AS resolved_revision_digest
+                FROM bots
+                LEFT JOIN revisions
+                  ON revisions.bot_id = bots.id
+                 AND revisions.number = bots.current_revision
+                WHERE bots.id = ?
+                """,
                 (bot_id,),
             ).fetchone()
-            if revision is None:
+            if bot is None or not bot["is_builtin"]:
                 return
-            if json.loads(revision["strategy_json"]) == json.loads(serialized):
+            # The managed pointer advances only when the seeder appends a
+            # revision. Any regular edit changes current_revision_id without
+            # changing builtin_revision_id and permanently opts out of sync.
+            if (
+                bot["resolved_revision_id"] is None
+                or bot["current_revision_id"] != bot["resolved_revision_id"]
+                or bot["builtin_revision_id"] != bot["current_revision_id"]
+            ):
                 return
-            now = utc_now()
-            connection.execute(
-                """
-                UPDATE revisions SET strategy_json = ?, created_at = ?
-                WHERE bot_id = ? AND number = 1
-                """,
-                (serialized, now, bot_id),
+            desired_tags = list(fixture["tags"])
+            metadata_changed = (
+                bot["name"] != fixture["name"]
+                or bot["description"] != fixture["description"]
+                or bot["race"] != fixture["race"]
+                or json.loads(bot["tags_json"]) != desired_tags
             )
-            connection.execute(
+            if bot["resolved_revision_digest"] == digest:
+                if not metadata_changed:
+                    return
+                connection.execute(
+                    """
+                    UPDATE bots
+                    SET name = ?, description = ?, race = ?, tags_json = ?,
+                        updated_at = ?
+                    WHERE id = ? AND current_revision_id = ?
+                        AND builtin_revision_id = ?
+                    """,
+                    (
+                        fixture["name"],
+                        fixture["description"],
+                        fixture["race"],
+                        json.dumps(desired_tags),
+                        utc_now(),
+                        bot_id,
+                        bot["current_revision_id"],
+                        bot["builtin_revision_id"],
+                    ),
+                )
+                return
+
+            now = utc_now()
+            next_revision = int(bot["current_revision"]) + 1
+            revision = self._insert_revision(
+                connection,
+                bot_id,
+                next_revision,
+                strategy,
+                "Synchronized built-in fixture",
+                now,
+            )
+            updated = connection.execute(
                 """
                 UPDATE bots
-                SET name = ?, description = ?, race = ?, tags_json = ?, updated_at = ?
-                WHERE id = ?
+                SET name = ?, description = ?, race = ?, tags_json = ?,
+                    current_revision = ?, current_revision_id = ?,
+                    current_revision_digest = ?, builtin_revision_id = ?,
+                    builtin_revision_digest = ?, updated_at = ?
+                WHERE id = ? AND current_revision_id = ?
+                    AND builtin_revision_id = ?
                 """,
                 (
                     fixture["name"],
                     fixture["description"],
                     fixture["race"],
-                    json.dumps(fixture["tags"]),
+                    json.dumps(desired_tags),
+                    next_revision,
+                    revision["id"],
+                    revision["content_digest"],
+                    revision["id"],
+                    revision["content_digest"],
                     now,
                     bot_id,
+                    bot["current_revision_id"],
+                    bot["builtin_revision_id"],
                 ),
             )
+            if updated.rowcount != 1:
+                raise ConflictError(
+                    "Built-in changed while its fixture revision was being saved."
+                )
 
     def unique_slug(self, desired: str, exclude_id: str | None = None) -> str:
         base = slugify(desired)
@@ -314,13 +273,28 @@ class StudioRepository:
                     now,
                 ),
             )
-            self._insert_revision(
+            revision = self._insert_revision(
                 connection,
                 bot_id,
                 1,
                 bot.strategy,
                 summary,
                 now,
+            )
+            connection.execute(
+                """
+                UPDATE bots
+                SET current_revision_id = ?, current_revision_digest = ?,
+                    builtin_revision_id = ?, builtin_revision_digest = ?
+                WHERE id = ?
+                """,
+                (
+                    revision["id"],
+                    revision["content_digest"],
+                    revision["id"] if is_builtin else None,
+                    revision["content_digest"] if is_builtin else None,
+                    bot_id,
+                ),
             )
         return self.get_bot(bot_id)
 
@@ -332,21 +306,66 @@ class StudioRepository:
         strategy: StrategyDocument,
         summary: str,
         created_at: str | None = None,
-    ) -> None:
+    ) -> dict[str, str]:
+        revision_id = str(uuid4())
+        serialized = canonical_json(strategy.model_dump(mode="json"))
+        digest = content_digest(serialized)
+        timestamp = created_at or utc_now()
         connection.execute(
             """
-            INSERT INTO revisions (id, bot_id, number, strategy_json, summary, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO revisions (
+                id, bot_id, number, strategy_json, content_digest, summary, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(uuid4()),
+                revision_id,
                 bot_id,
                 number,
-                strategy.model_dump_json(),
+                serialized,
+                digest,
                 summary,
-                created_at or utc_now(),
+                timestamp,
             ),
         )
+        return {
+            "id": revision_id,
+            "content_digest": digest,
+            "created_at": timestamp,
+        }
+
+    def _revision_identity(
+        self,
+        connection: sqlite3.Connection,
+        bot_id: str,
+        revision_number: int,
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT id, bot_id, number, strategy_json, content_digest, summary,
+                created_at
+            FROM revisions
+            WHERE bot_id = ? AND number = ?
+            """,
+            (bot_id, revision_number),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(
+                f"Revision {revision_number} not found for bot {bot_id}."
+            )
+        actual_digest = content_digest(row["strategy_json"])
+        if row["content_digest"] != actual_digest:
+            raise ConflictError(
+                f"Revision {row['id']} failed its content integrity check."
+            )
+        return {
+            "id": row["id"],
+            "bot_id": row["bot_id"],
+            "number": row["number"],
+            "strategy_json": row["strategy_json"],
+            "content_digest": row["content_digest"],
+            "summary": row["summary"],
+            "created_at": row["created_at"],
+        }
 
     def list_bots(
         self,
@@ -392,10 +411,18 @@ class StudioRepository:
             ).fetchone()
             if row is None or (not include_deleted and row["deleted_at"]):
                 raise NotFoundError(f"Bot not found: {bot_id_or_slug}")
-            revision = connection.execute(
-                "SELECT * FROM revisions WHERE bot_id = ? AND number = ?",
-                (row["id"], row["current_revision"]),
-            ).fetchone()
+            revision = self._revision_identity(
+                connection,
+                row["id"],
+                row["current_revision"],
+            )
+            if (
+                row["current_revision_id"] != revision["id"]
+                or row["current_revision_digest"] != revision["content_digest"]
+            ):
+                raise ConflictError(
+                    f"Bot {row['id']} has inconsistent current revision provenance."
+                )
         result = self._bot_row(row, include_strategy=False)
         result["strategy"] = StrategyDocument.model_validate_json(
             revision["strategy_json"]
@@ -415,6 +442,8 @@ class StudioRepository:
             "forkedFrom": row["forked_from"],
             "deletedAt": row["deleted_at"],
             "currentRevision": row["current_revision"],
+            "currentRevisionId": row["current_revision_id"],
+            "currentRevisionDigest": row["current_revision_digest"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -431,22 +460,18 @@ class StudioRepository:
         next_revision = current["currentRevision"] + 1
         now = utc_now()
         with self.connect() as connection:
-            connection.execute(
-                """
-                UPDATE bots
-                SET name = ?, description = ?, tags_json = ?, current_revision = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    update.name if update.name is not None else current["name"],
-                    update.description if update.description is not None else current["description"],
-                    json.dumps(update.tags if update.tags is not None else current["tags"]),
-                    next_revision,
-                    now,
-                    bot_id,
-                ),
-            )
-            self._insert_revision(
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT current_revision FROM bots WHERE id = ?",
+                (bot_id,),
+            ).fetchone()
+            if latest is None:
+                raise NotFoundError(f"Bot not found: {bot_id}")
+            if latest["current_revision"] != current["currentRevision"]:
+                raise ConflictError(
+                    "Bot changed while the new revision was being saved."
+                )
+            revision = self._insert_revision(
                 connection,
                 bot_id,
                 next_revision,
@@ -454,6 +479,28 @@ class StudioRepository:
                 update.change_summary,
                 now,
             )
+            updated = connection.execute(
+                """
+                UPDATE bots
+                SET name = ?, description = ?, tags_json = ?,
+                    current_revision = ?, current_revision_id = ?,
+                    current_revision_digest = ?, updated_at = ?
+                WHERE id = ? AND current_revision = ?
+                """,
+                (
+                    update.name if update.name is not None else current["name"],
+                    update.description if update.description is not None else current["description"],
+                    json.dumps(update.tags if update.tags is not None else current["tags"]),
+                    next_revision,
+                    revision["id"],
+                    revision["content_digest"],
+                    now,
+                    bot_id,
+                    current["currentRevision"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("Bot changed while the new revision was being saved.")
         return self.get_bot(bot_id)
 
     def fork_bot(self, bot_id: str, requested_name: str | None = None) -> dict[str, Any]:
@@ -494,7 +541,7 @@ class StudioRepository:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, number, summary, created_at
+                SELECT id, number, content_digest, summary, created_at
                 FROM revisions WHERE bot_id = ? ORDER BY number DESC
                 """,
                 (bot_id,),
@@ -506,12 +553,7 @@ class StudioRepository:
     ) -> dict[str, Any]:
         current = self.get_bot(bot_id)
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT strategy_json FROM revisions WHERE bot_id = ? AND number = ?",
-                (bot_id, revision_number),
-            ).fetchone()
-        if row is None:
-            raise NotFoundError(f"Revision {revision_number} not found.")
+            row = self._revision_identity(connection, bot_id, revision_number)
         return self.update_bot(
             bot_id,
             BotUpdate(
@@ -526,15 +568,34 @@ class StudioRepository:
     ) -> dict[str, Any]:
         proposal_id = str(uuid4())
         now = utc_now()
+        normalized_base_id = str(base_bot_id) if base_bot_id else None
         with self.connect() as connection:
+            base_revision: dict[str, Any] | None = None
+            if normalized_base_id:
+                base = connection.execute(
+                    "SELECT current_revision FROM bots WHERE id = ?",
+                    (normalized_base_id,),
+                ).fetchone()
+                if base is None:
+                    raise NotFoundError(f"Bot not found: {normalized_base_id}")
+                base_revision = self._revision_identity(
+                    connection,
+                    normalized_base_id,
+                    base["current_revision"],
+                )
             connection.execute(
                 """
-                INSERT INTO proposals (id, base_bot_id, payload_json, status, created_at)
-                VALUES (?, ?, ?, 'pending', ?)
+                INSERT INTO proposals (
+                    id, base_bot_id, base_revision, base_revision_id,
+                    base_revision_digest, payload_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
                 (
                     proposal_id,
-                    str(base_bot_id) if base_bot_id else None,
+                    normalized_base_id,
+                    base_revision["number"] if base_revision else None,
+                    base_revision["id"] if base_revision else None,
+                    base_revision["content_digest"] if base_revision else None,
                     proposal.model_dump_json(),
                     now,
                 ),
@@ -551,6 +612,9 @@ class StudioRepository:
         return {
             "id": row["id"],
             "baseBotId": row["base_bot_id"],
+            "baseRevision": row["base_revision"],
+            "baseRevisionId": row["base_revision_id"],
+            "baseRevisionDigest": row["base_revision_digest"],
             "status": row["status"],
             "createdAt": row["created_at"],
             "appliedAt": row["applied_at"],
@@ -576,16 +640,10 @@ class StudioRepository:
         bot = self.get_bot(bot_id_or_slug, include_deleted=False)
         revision_number = revision_number or bot["currentRevision"]
         with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT strategy_json, summary, created_at
-                FROM revisions WHERE bot_id = ? AND number = ?
-                """,
-                (bot["id"], revision_number),
-            ).fetchone()
-        if row is None:
-            raise NotFoundError(
-                f"Revision {revision_number} not found for {bot['name']}."
+            row = self._revision_identity(
+                connection,
+                bot["id"],
+                revision_number,
             )
         return {
             **bot,
@@ -595,6 +653,8 @@ class StudioRepository:
             "revisionSummary": row["summary"],
             "revisionCreatedAt": row["created_at"],
             "selectedRevision": revision_number,
+            "selectedRevisionId": row["id"],
+            "selectedRevisionDigest": row["content_digest"],
         }
 
     # Match history -----------------------------------------------------
@@ -606,6 +666,7 @@ class StudioRepository:
         source: str,
         participants: list[dict[str, Any]],
         regression_batch_id: str | None = None,
+        regression_game_id: str | None = None,
         match_id: str | None = None,
     ) -> dict[str, Any]:
         if len(participants) != 2:
@@ -623,12 +684,26 @@ class StudioRepository:
                 (match_id, source, map_name, regression_batch_id, now, now),
             )
             for slot, participant in enumerate(participants, start=1):
+                revision: dict[str, Any] | None = None
+                if participant["participant_type"] == "bot":
+                    participant_bot_id = participant.get("bot_id")
+                    participant_revision = participant.get("bot_revision")
+                    if participant_bot_id is None or participant_revision is None:
+                        raise ValueError(
+                            "Bot match participants require a pinned revision."
+                        )
+                    revision = self._revision_identity(
+                        connection,
+                        participant_bot_id,
+                        int(participant_revision),
+                    )
                 connection.execute(
                     """
                     INSERT INTO match_participants (
                         match_id, slot, participant_type, bot_id, bot_revision,
+                        bot_revision_id, bot_revision_digest,
                         name, requested_race, resolved_race, difficulty, result
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         match_id,
@@ -636,12 +711,27 @@ class StudioRepository:
                         participant["participant_type"],
                         participant.get("bot_id"),
                         participant.get("bot_revision"),
+                        revision["id"] if revision else None,
+                        revision["content_digest"] if revision else None,
                         participant["name"],
                         participant["requested_race"],
                         participant.get("resolved_race"),
                         participant.get("difficulty"),
                     ),
                 )
+            if regression_game_id is not None:
+                linked = connection.execute(
+                    """
+                    UPDATE regression_games
+                    SET status = 'starting', match_id = ?
+                    WHERE id = ? AND batch_id = ?
+                    """,
+                    (match_id, regression_game_id, regression_batch_id),
+                )
+                if linked.rowcount == 0:
+                    raise NotFoundError(
+                        f"Regression game not found: {regression_game_id}"
+                    )
         return self.get_match(match_id)
 
     def set_match_running(self, match_id: str) -> dict[str, Any]:
@@ -667,6 +757,83 @@ class StudioRepository:
             )
         if updated.rowcount == 0:
             raise NotFoundError(f"Active match not found: {match_id}")
+
+    def append_match_log(
+        self,
+        match_id: str,
+        sequence: int,
+        line: str,
+        *,
+        retain: int,
+    ) -> None:
+        if sequence < 1:
+            raise ValueError("Match log sequences start at 1.")
+        if retain < 1:
+            raise ValueError("At least one match log must be retained.")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO match_logs (match_id, sequence, line, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (match_id, sequence, line, utc_now()),
+            )
+            connection.execute(
+                """
+                DELETE FROM match_logs
+                WHERE match_id = ? AND sequence <= ?
+                """,
+                (match_id, sequence - retain),
+            )
+
+    def list_match_logs(
+        self, match_id: str, *, after: int = 0
+    ) -> dict[str, Any]:
+        self.get_match(match_id)
+        cursor = max(0, after)
+        with self.connect() as connection:
+            bounds = connection.execute(
+                """
+                SELECT MIN(sequence) AS first_sequence,
+                       MAX(sequence) AS last_sequence
+                FROM match_logs WHERE match_id = ?
+                """,
+                (match_id,),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT sequence, line FROM match_logs
+                WHERE match_id = ? AND sequence > ?
+                ORDER BY sequence
+                """,
+                (match_id, cursor),
+            ).fetchall()
+        return {
+            "firstSequence": bounds["first_sequence"],
+            "lastSequence": bounds["last_sequence"],
+            "items": [
+                {"sequence": row["sequence"], "line": row["line"]}
+                for row in rows
+            ],
+        }
+
+    def get_match_log_bounds(self, match_id: str) -> dict[str, int | None]:
+        self.get_match(match_id)
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MIN(sequence) AS first_sequence,
+                       MAX(sequence) AS last_sequence,
+                       COUNT(*) AS retained_count
+                FROM match_logs WHERE match_id = ?
+                """,
+                (match_id,),
+            ).fetchone()
+        return {
+            "firstSequence": row["first_sequence"],
+            "lastSequence": row["last_sequence"],
+            "retainedCount": row["retained_count"],
+        }
 
     def finalize_match(
         self,
@@ -752,6 +919,8 @@ class StudioRepository:
                     "participantType": participant["participant_type"],
                     "botId": participant["bot_id"],
                     "botRevision": participant["bot_revision"],
+                    "botRevisionId": participant["bot_revision_id"],
+                    "botRevisionDigest": participant["bot_revision_digest"],
                     "name": participant["name"],
                     "requestedRace": participant["requested_race"],
                     "resolvedRace": participant["resolved_race"],
@@ -949,7 +1118,7 @@ class StudioRepository:
                 connection.execute(
                     """
                     UPDATE regression_games SET status = 'queued', match_id = NULL
-                    WHERE batch_id = ? AND status = 'running'
+                    WHERE batch_id = ? AND status IN ('starting', 'running')
                     """,
                     (batch["id"],),
                 )
@@ -981,12 +1150,27 @@ class StudioRepository:
             "DELETE FROM benchmark_scenarios WHERE suite_id = ?", (suite_id,)
         )
         for position, scenario in enumerate(suite.scenarios):
+            opponent_bot_id = (
+                str(scenario.opponent_bot_id) if scenario.opponent_bot_id else None
+            )
+            opponent_revision: dict[str, Any] | None = None
+            if scenario.opponent_type == "bot":
+                if opponent_bot_id is None or scenario.opponent_revision is None:
+                    raise ValueError(
+                        "Bot benchmark opponents require a pinned revision."
+                    )
+                opponent_revision = self._revision_identity(
+                    connection,
+                    opponent_bot_id,
+                    scenario.opponent_revision,
+                )
             connection.execute(
                 """
                 INSERT INTO benchmark_scenarios (
                     id, suite_id, position, name, map_name, opponent_type,
-                    enemy_race, difficulty, opponent_bot_id, opponent_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    enemy_race, difficulty, opponent_bot_id, opponent_revision,
+                    opponent_revision_id, opponent_revision_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid4()),
@@ -997,8 +1181,14 @@ class StudioRepository:
                     scenario.opponent_type,
                     scenario.enemy_race if scenario.opponent_type == "computer" else None,
                     scenario.difficulty if scenario.opponent_type == "computer" else None,
-                    str(scenario.opponent_bot_id) if scenario.opponent_bot_id else None,
+                    opponent_bot_id,
                     scenario.opponent_revision,
+                    opponent_revision["id"] if opponent_revision else None,
+                    (
+                        opponent_revision["content_digest"]
+                        if opponent_revision
+                        else None
+                    ),
                 ),
             )
 
@@ -1050,6 +1240,8 @@ class StudioRepository:
                     "difficulty": scenario["difficulty"],
                     "opponentBotId": scenario["opponent_bot_id"],
                     "opponentRevision": scenario["opponent_revision"],
+                    "opponentRevisionId": scenario["opponent_revision_id"],
+                    "opponentRevisionDigest": scenario["opponent_revision_digest"],
                 }
                 for scenario in scenarios
             ],
@@ -1135,15 +1327,21 @@ class StudioRepository:
                 """
                 INSERT INTO regression_batches (
                     id, bot_id, candidate_revision, baseline_revision,
+                    candidate_revision_id, candidate_revision_digest,
+                    baseline_revision_id, baseline_revision_digest,
                     suite_id, suite_name, games_per_scenario, concurrency,
                     status, total_games, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     batch_id,
                     bot_id,
                     candidate["currentRevision"],
                     baseline["selectedRevision"],
+                    candidate["selectedRevisionId"],
+                    candidate["selectedRevisionDigest"],
+                    baseline["selectedRevisionId"],
+                    baseline["selectedRevisionDigest"],
                     suite_id,
                     suite["name"],
                     games_per_scenario,
@@ -1160,17 +1358,23 @@ class StudioRepository:
                         + repetition * 9176
                     ) % 2_147_483_647
                     for role, revision in (
-                        ("candidate", candidate["currentRevision"]),
-                        ("baseline", baseline["selectedRevision"]),
+                        ("candidate", candidate),
+                        ("baseline", baseline),
                     ):
                         connection.execute(
                             """
                             INSERT INTO regression_games (
                                 id, batch_id, scenario_position, scenario_name,
                                 map_name, opponent_type, enemy_race, difficulty,
-                                opponent_bot_id, opponent_revision, tested_role,
-                                tested_revision, repetition, random_seed, status
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+                                opponent_bot_id, opponent_revision,
+                                opponent_revision_id, opponent_revision_digest,
+                                tested_role, tested_revision, tested_revision_id,
+                                tested_revision_digest, repetition, random_seed,
+                                status
+                            ) VALUES (
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, 'queued'
+                            )
                             """,
                             (
                                 str(uuid4()),
@@ -1183,8 +1387,12 @@ class StudioRepository:
                                 scenario["difficulty"],
                                 scenario["opponentBotId"],
                                 scenario["opponentRevision"],
+                                scenario["opponentRevisionId"],
+                                scenario["opponentRevisionDigest"],
                                 role,
-                                revision,
+                                revision["selectedRevision"],
+                                revision["selectedRevisionId"],
+                                revision["selectedRevisionDigest"],
                                 repetition,
                                 seed,
                             ),
@@ -1230,7 +1438,14 @@ class StudioRepository:
         started = utc_now() if status == "running" else None
         finished = (
             utc_now()
-            if status in {"completed", "cancelled", "failed", "interrupted"}
+            if status
+            in {
+                "completed",
+                "completed_with_failures",
+                "cancelled",
+                "failed",
+                "interrupted",
+            }
             else None
         )
         with self.connect() as connection:
@@ -1402,6 +1617,10 @@ class StudioRepository:
             "botId": row["bot_id"],
             "candidateRevision": row["candidate_revision"],
             "baselineRevision": row["baseline_revision"],
+            "candidateRevisionId": row["candidate_revision_id"],
+            "candidateRevisionDigest": row["candidate_revision_digest"],
+            "baselineRevisionId": row["baseline_revision_id"],
+            "baselineRevisionDigest": row["baseline_revision_digest"],
             "suiteId": row["suite_id"],
             "suiteName": row["suite_name"],
             "gamesPerScenario": row["games_per_scenario"],
@@ -1450,8 +1669,12 @@ class StudioRepository:
             "difficulty": row["difficulty"],
             "opponentBotId": row["opponent_bot_id"],
             "opponentRevision": row["opponent_revision"],
+            "opponentRevisionId": row["opponent_revision_id"],
+            "opponentRevisionDigest": row["opponent_revision_digest"],
             "testedRole": row["tested_role"],
             "testedRevision": row["tested_revision"],
+            "testedRevisionId": row["tested_revision_id"],
+            "testedRevisionDigest": row["tested_revision_digest"],
             "repetition": row["repetition"],
             "randomSeed": row["random_seed"],
             "matchId": row["match_id"],

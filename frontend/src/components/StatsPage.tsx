@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, jsonOptions } from "../api";
-import type {
-  BenchmarkScenario,
-  BenchmarkSuite,
-  BotStats,
-  BotSummary,
-  MatchRecord,
-  RegressionBatch,
+import {
+  shortDigest,
+  type BenchmarkScenario,
+  type BenchmarkSuite,
+  type BotStats,
+  type BotSummary,
+  type MatchRecord,
+  type RegressionBatch,
 } from "../models";
 
 interface Revision {
   id: string;
   number: number;
+  content_digest?: string;
   summary: string;
   created_at: string;
 }
@@ -27,6 +29,16 @@ interface SuiteDraft {
   description: string;
   scenarios: BenchmarkScenario[];
 }
+
+const TERMINAL_REGRESSION_STATUSES = new Set([
+  "completed",
+  "completed_with_failures",
+  "cancelled",
+  "failed",
+  "interrupted",
+]);
+const REGRESSION_POLL_INTERVAL_MS = 1_000;
+const MAX_REGRESSION_POLL_ATTEMPTS = 1_800;
 
 const emptyScenario = (mapName = ""): BenchmarkScenario => ({
   name: "Computer benchmark",
@@ -69,6 +81,8 @@ export default function StatsPage({
   const [concurrency, setConcurrency] = useState(1);
   const [activeBatch, setActiveBatch] = useState<RegressionBatch | null>(null);
   const regressionEvents = useRef<EventSource | null>(null);
+  const regressionPollTimer = useRef<number | null>(null);
+  const regressionPollGeneration = useRef(0);
 
   const loadCore = useCallback(async () => {
     const [statsResult, revisionResult, suiteResult, regressionResult, mapResult, botResult] =
@@ -120,8 +134,20 @@ export default function StatsPage({
 
   useEffect(() => {
     void reload();
-    return () => regressionEvents.current?.close();
   }, [reload]);
+
+  useEffect(
+    () => () => {
+      regressionPollGeneration.current += 1;
+      regressionEvents.current?.close();
+      regressionEvents.current = null;
+      if (regressionPollTimer.current !== null) {
+        window.clearTimeout(regressionPollTimer.current);
+        regressionPollTimer.current = null;
+      }
+    },
+    [],
+  );
 
   const saveSuite = async () => {
     if (!suiteDraft) return;
@@ -214,21 +240,78 @@ export default function StatsPage({
     }
   };
 
-  const watchBatch = (batchId: string) => {
+  const clearRegressionPollTimer = () => {
+    if (regressionPollTimer.current !== null) {
+      window.clearTimeout(regressionPollTimer.current);
+      regressionPollTimer.current = null;
+    }
+  };
+
+  const closeRegressionEvents = () => {
     regressionEvents.current?.close();
+    regressionEvents.current = null;
+  };
+
+  const stopWatchingBatch = () => {
+    regressionPollGeneration.current += 1;
+    clearRegressionPollTimer();
+    closeRegressionEvents();
+  };
+
+  const finishBatchUpdate = (batch: RegressionBatch) => {
+    setActiveBatch(batch);
+    if (!TERMINAL_REGRESSION_STATUSES.has(batch.status)) return false;
+    stopWatchingBatch();
+    void reload();
+    return true;
+  };
+
+  const pollBatchUntilTerminal = (batchId: string) => {
+    clearRegressionPollTimer();
+    const generation = ++regressionPollGeneration.current;
+
+    const poll = async (attempt: number) => {
+      if (regressionPollGeneration.current !== generation) return;
+
+      try {
+        const batch = await api<RegressionBatch>(`/regressions/${batchId}`);
+        if (regressionPollGeneration.current !== generation) return;
+        if (finishBatchUpdate(batch)) return;
+      } catch {
+        // Keep polling through transient API failures while the backend recovers.
+      }
+
+      if (regressionPollGeneration.current !== generation) return;
+      if (attempt + 1 >= MAX_REGRESSION_POLL_ATTEMPTS) {
+        setError(
+          "Could not confirm the final regression status. Check that the backend is running.",
+        );
+        return;
+      }
+      regressionPollTimer.current = window.setTimeout(
+        () => void poll(attempt + 1),
+        REGRESSION_POLL_INTERVAL_MS,
+      );
+    };
+
+    void poll(0);
+  };
+
+  const watchBatch = (batchId: string) => {
+    stopWatchingBatch();
     const source = new EventSource(`/api/regressions/${batchId}/events`);
     regressionEvents.current = source;
     source.onmessage = (event) => {
       const payload = JSON.parse(event.data) as RegressionBatch & { type: string };
-      setActiveBatch(payload);
-      if (["completed", "cancelled", "failed", "interrupted"].includes(payload.status)) {
-        source.close();
-        void reload();
-      }
+      finishBatchUpdate(payload);
     };
     source.onerror = () => {
-      source.close();
-      void api<RegressionBatch>(`/regressions/${batchId}`).then(setActiveBatch);
+      if (regressionEvents.current === source) {
+        closeRegressionEvents();
+        pollBatchUntilTerminal(batchId);
+      } else {
+        source.close();
+      }
     };
   };
 
@@ -241,7 +324,7 @@ export default function StatsPage({
         jsonOptions("POST"),
       );
       setActiveBatch(result);
-      regressionEvents.current?.close();
+      stopWatchingBatch();
       await reload();
     } finally {
       setBusy(false);
@@ -260,8 +343,9 @@ export default function StatsPage({
         </button>
         <div className="editor-title">
           <strong>Performance</strong>
-          <span>
-            {bot.name} · current v{bot.currentRevision}
+          <span title={bot.currentRevisionDigest ?? undefined}>
+            {bot.name} · current{" "}
+            {revisionReference(bot.currentRevision, bot.currentRevisionDigest)}
           </span>
         </div>
         <button className="button primary" onClick={onRun}>
@@ -374,28 +458,49 @@ export default function StatsPage({
               </div>
             </header>
             <div className="match-list">
-              {matches.map((match) => (
-                <article className="match-row" key={match.id}>
-                  <span className={`result-badge ${match.perspectiveResult ?? match.status}`}>
-                    {match.perspectiveResult ?? match.status}
-                  </span>
-                  <div>
-                    <strong>{match.opponent.name}</strong>
-                    <span>
-                      {match.mapName} · {match.opponent.resolvedRace ?? match.opponent.requestedRace}
-                      {match.opponent.difficulty
-                        ? ` · ${match.opponent.difficulty.replaceAll("_", " ")}`
-                        : ""}
+              {matches.map((match) => {
+                const testedParticipant = match.participants.find(
+                  (participant) => participant.botId === bot.id,
+                );
+                const testedRevision = testedParticipant?.botRevision
+                  ? revisionReference(
+                      testedParticipant.botRevision,
+                      testedParticipant.botRevisionDigest,
+                    )
+                  : null;
+                const opponentRevision =
+                  match.opponent.participantType === "bot" &&
+                  match.opponent.botRevision
+                    ? revisionReference(
+                        match.opponent.botRevision,
+                        match.opponent.botRevisionDigest,
+                      )
+                    : null;
+                return (
+                  <article className="match-row" key={match.id}>
+                    <span className={`result-badge ${match.perspectiveResult ?? match.status}`}>
+                      {match.perspectiveResult ?? match.status}
                     </span>
-                  </div>
-                  <div>
-                    <strong>{formatDuration(match.gameTimeSeconds)}</strong>
-                    <span>
-                      {match.source} · {new Date(match.createdAt).toLocaleDateString()}
-                    </span>
-                  </div>
-                </article>
-              ))}
+                    <div>
+                      <strong>{match.opponent.name}</strong>
+                      <span>
+                        {match.mapName} · {match.opponent.resolvedRace ?? match.opponent.requestedRace}
+                        {match.opponent.difficulty
+                          ? ` · ${match.opponent.difficulty.replaceAll("_", " ")}`
+                          : ""}
+                        {opponentRevision ? ` · opponent ${opponentRevision}` : ""}
+                      </span>
+                    </div>
+                    <div>
+                      <strong>{formatDuration(match.gameTimeSeconds)}</strong>
+                      <span title={testedParticipant?.botRevisionDigest ?? undefined}>
+                        {match.source} · {new Date(match.createdAt).toLocaleDateString()}
+                        {testedRevision ? ` · tested ${testedRevision}` : ""}
+                      </span>
+                    </div>
+                  </article>
+                );
+              })}
               {!matches.length && <div className="compact-empty">No matches match the filters.</div>}
             </div>
           </div>
@@ -487,7 +592,13 @@ export default function StatsPage({
           <div className="regression-config">
             <label>
               Candidate
-              <div className="readonly-field">Current revision v{bot.currentRevision}</div>
+              <div
+                className="readonly-field"
+                title={bot.currentRevisionDigest ?? undefined}
+              >
+                Current revision{" "}
+                {revisionReference(bot.currentRevision, bot.currentRevisionDigest)}
+              </div>
             </label>
             <label>
               Baseline revision
@@ -499,7 +610,8 @@ export default function StatsPage({
                   .filter((revision) => revision.number < bot.currentRevision)
                   .map((revision) => (
                     <option key={revision.id} value={revision.number}>
-                      v{revision.number} · {revision.summary}
+                      {revisionReference(revision.number, revision.content_digest)} ·{" "}
+                      {revision.summary}
                     </option>
                   ))}
               </select>
@@ -586,9 +698,18 @@ export default function StatsPage({
                   }}
                 >
                   <span>
-                    v{batch.candidateRevision} vs v{batch.baselineRevision} · {batch.suiteName}
+                    {revisionReference(
+                      batch.candidateRevision,
+                      batch.candidateRevisionDigest,
+                    )}{" "}
+                    vs{" "}
+                    {revisionReference(
+                      batch.baselineRevision,
+                      batch.baselineRevisionDigest,
+                    )}{" "}
+                    · {batch.suiteName}
                   </span>
-                  <strong>{batch.status}</strong>
+                  <strong>{formatRegressionStatus(batch.status)}</strong>
                 </button>
               ))}
             </div>
@@ -859,10 +980,18 @@ function RegressionProgress({
       <header>
         <div>
           <strong>
-            v{batch.candidateRevision} vs v{batch.baselineRevision}
+            {revisionReference(
+              batch.candidateRevision,
+              batch.candidateRevisionDigest,
+            )}{" "}
+            vs{" "}
+            {revisionReference(
+              batch.baselineRevision,
+              batch.baselineRevisionDigest,
+            )}
           </strong>
           <span>
-            {batch.suiteName} · {batch.status}
+            {batch.suiteName} · {formatRegressionStatus(batch.status)}
           </span>
         </div>
         {isActive(batch) && (
@@ -883,9 +1012,26 @@ function RegressionProgress({
         {batch.completedGames} / {batch.totalGames} matches · {progress}% ·{" "}
         {batch.pairedSamples} paired sample{batch.pairedSamples === 1 ? "" : "s"}
       </span>
+      {batch.status === "completed_with_failures" && (
+        <span role="status">
+          Finished with failed matches; comparisons use completed pairs only.
+        </span>
+      )}
       <div className="comparison-grid">
-        <ComparisonCard label={`Current v${batch.candidateRevision}`} data={batch.comparison.candidate} />
-        <ComparisonCard label={`Baseline v${batch.baselineRevision}`} data={batch.comparison.baseline} />
+        <ComparisonCard
+          label={`Current ${revisionReference(
+            batch.candidateRevision,
+            batch.candidateRevisionDigest,
+          )}`}
+          data={batch.comparison.candidate}
+        />
+        <ComparisonCard
+          label={`Baseline ${revisionReference(
+            batch.baselineRevision,
+            batch.baselineRevisionDigest,
+          )}`}
+          data={batch.comparison.baseline}
+        />
         <div className="comparison-card delta">
           <span>Win-rate delta</span>
           <strong>
@@ -952,6 +1098,18 @@ function toDraft(suite: BenchmarkSuite): SuiteDraft {
 
 function isActive(batch: RegressionBatch): boolean {
   return ["queued", "starting", "running", "cancelling"].includes(batch.status);
+}
+
+function formatRegressionStatus(status: string): string {
+  return status === "completed_with_failures" ? "completed with failures" : status;
+}
+
+function revisionReference(
+  revision: number,
+  digest: string | null | undefined,
+): string {
+  const abbreviated = shortDigest(digest);
+  return `v${revision}${abbreviated ? `@${abbreviated}` : ""}`;
 }
 
 function formatPercent(value: number | null | undefined): string {

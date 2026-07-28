@@ -102,7 +102,11 @@ export default function App() {
     return (
       <RunConsole
         bot={screen.bot}
-        onBack={() => setScreen({ name: "library", trash: false })}
+        onBack={async () => {
+          await refreshBots();
+          setScreen({ name: "library", trash: false });
+        }}
+        onMatchFinished={refreshBots}
       />
     );
   }

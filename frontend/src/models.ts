@@ -13,19 +13,21 @@ export interface Condition {
 }
 
 export interface StrategyAction {
+  [key: string]: string | string[] | number | null | undefined;
   type: string;
   unit?: string | null;
   units?: string[];
   fallback_units?: string[];
   structure?: string | null;
+  upgrade?: string | null;
   amount?: number | null;
   buffer?: number | null;
   distance?: number;
-  placement?: string;
   min_size?: number | null;
   required_unit?: string | null;
   required_amount?: number | null;
   target?: string;
+  health_threshold?: number | null;
 }
 
 export interface StrategyRule {
@@ -34,7 +36,7 @@ export interface StrategyRule {
   enabled: boolean;
   priority: number;
   execution: "continuous" | "once" | "cooldown";
-  cooldown_seconds: number;
+  cooldown_seconds?: number;
   trigger: Condition;
   actions: StrategyAction[];
 }
@@ -54,7 +56,6 @@ export interface StrategyDocument {
   opening_chat?: string | null;
   settings: {
     max_supply: number;
-    attack_target: string;
     stalemate_detection: boolean;
     stalemate_grace_period_seconds: number;
     stalemate_timeout_seconds: number;
@@ -73,6 +74,8 @@ export interface BotSummary {
   forkedFrom: string | null;
   deletedAt: string | null;
   currentRevision: number;
+  currentRevisionId?: string;
+  currentRevisionDigest?: string;
   createdAt: string;
   updatedAt: string;
   stats?: {
@@ -89,16 +92,77 @@ export interface BotRecord extends BotSummary {
   revisionSummary: string;
 }
 
+export interface UnitMetadata {
+  race: Race;
+  roles: string[];
+  producer: string | null;
+  techRequirement?: string | null;
+}
+
+export interface StructureMetadata {
+  race: Race;
+  roles: string[];
+}
+
+export interface UpgradeMetadata {
+  race: Race;
+  producer: string;
+}
+
+export interface EntityDefaults {
+  worker: string;
+  combatUnit: string;
+  townhall: string;
+  gas: string;
+  supply: string;
+  upgrade: string;
+}
+
+export interface ActionFieldSpec {
+  name: string;
+  kind:
+    | "integer"
+    | "number"
+    | "ratio"
+    | "unit"
+    | "unit_list"
+    | "structure"
+    | "target"
+    | "upgrade";
+  required: boolean;
+  unitRoles?: string[];
+  structureRoles?: string[];
+  targets?: string[];
+}
+
+export interface ActionSpec {
+  label: string;
+  description: string;
+  handler?: string;
+  requiredFields: string[];
+  optionalFields: string[];
+  races: Race[];
+  fields: ActionFieldSpec[];
+  defaultsByRace: Partial<Record<Race, StrategyAction>>;
+}
+
 export interface Catalog {
+  schemaVersions: number[];
   races: Race[];
   units: Record<Race, string[]>;
   structures: Record<Race, string[]>;
+  upgrades: Record<Race, string[]>;
+  unitMetadata: Record<string, UnitMetadata>;
+  structureMetadata: Record<string, StructureMetadata>;
+  upgradeMetadata: Record<string, UpgradeMetadata>;
+  entityDefaults: Record<Race, EntityDefaults>;
   conditionKinds: ConditionKind[];
   metrics: string[];
   comparators: Comparator[];
   actionTypes: string[];
+  actionSpecs: Record<string, ActionSpec>;
   executionPolicies: string[];
-  placements: string[];
+  targets: string[];
 }
 
 export interface ProposalRecord {
@@ -121,6 +185,8 @@ export interface MatchParticipant {
   participantType: "bot" | "computer";
   botId: string | null;
   botRevision: number | null;
+  botRevisionId?: string | null;
+  botRevisionDigest?: string | null;
   name: string;
   requestedRace: string;
   resolvedRace: string | null;
@@ -179,6 +245,8 @@ export interface BenchmarkScenario {
   difficulty: string | null;
   opponentBotId: string | null;
   opponentRevision: number | null;
+  opponentRevisionId?: string | null;
+  opponentRevisionDigest?: string | null;
 }
 
 export interface BenchmarkSuite {
@@ -195,8 +263,12 @@ export interface RegressionGame {
   id: string;
   batchId: string;
   scenarioName: string;
+  opponentRevisionId?: string | null;
+  opponentRevisionDigest?: string | null;
   testedRole: "candidate" | "baseline";
   testedRevision: number;
+  testedRevisionId?: string;
+  testedRevisionDigest?: string;
   repetition: number;
   matchId: string | null;
   status: string;
@@ -216,6 +288,10 @@ export interface RegressionBatch {
   botId: string;
   candidateRevision: number;
   baselineRevision: number;
+  candidateRevisionId?: string;
+  candidateRevisionDigest?: string;
+  baselineRevisionId?: string;
+  baselineRevisionDigest?: string;
   suiteId: string;
   suiteName: string;
   gamesPerScenario: number;
@@ -243,13 +319,7 @@ export interface RegressionBatch {
   }>;
 }
 
-export const alwaysCondition = (): Condition => ({
-  kind: "always",
-  comparator: "gte",
-  value: 0,
-  status: "total",
-  children: [],
-});
+export const alwaysCondition = (): Condition => ({ kind: "always" });
 
 export const blankStrategy = (race: Race): StrategyDocument => ({
   schema_version: 1,
@@ -257,7 +327,6 @@ export const blankStrategy = (race: Race): StrategyDocument => ({
   opening_chat: null,
   settings: {
     max_supply: 200,
-    attack_target: "enemy_start",
     stalemate_detection: true,
     stalemate_grace_period_seconds: 600,
     stalemate_timeout_seconds: 180,
@@ -276,7 +345,6 @@ export const blankStrategy = (race: Race): StrategyDocument => ({
           enabled: true,
           priority: 10,
           execution: "continuous",
-          cooldown_seconds: 1,
           trigger: alwaysCondition(),
           actions: [{ type: "distribute_workers" }],
         },
@@ -300,7 +368,18 @@ export function summarizeCondition(condition: Condition): string {
 }
 
 export function summarizeAction(action: StrategyAction): string {
-  const target = action.unit ?? action.structure ?? action.units?.join(" + ") ?? "";
-  const amount = action.amount ?? action.buffer ?? action.min_size;
+  const target =
+    action.unit ??
+    action.structure ??
+    action.upgrade ??
+    action.units?.join(" + ") ??
+    action.target ??
+    "";
+  const amount =
+    action.amount ?? action.buffer ?? action.min_size ?? action.health_threshold;
   return `${action.type.replaceAll("_", " ")}${target ? ` · ${target}` : ""}${amount != null ? ` · ${amount}` : ""}`;
+}
+
+export function shortDigest(digest: string | null | undefined, length = 8): string | null {
+  return digest ? digest.slice(0, length) : null;
 }
